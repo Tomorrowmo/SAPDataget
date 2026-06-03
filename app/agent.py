@@ -219,11 +219,25 @@ class Agent:
         self.on_event = on_event or (lambda kind, payload: None)
 
     # ---------- 主入口 ----------
-    def run(self, user_message: str, *, username: str = "cli_user") -> AgentResult:
+    def run(
+        self,
+        user_message: str,
+        *,
+        username: str = "cli_user",
+        history: list[tuple[str, str]] | None = None,
+    ) -> AgentResult:
+        """单次回合。
+
+        history: 先前回合的 (role, text) 列表 —— 用于多轮 (P1-11)。
+        """
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
         ]
+        for role, text in (history or []):
+            # 只挑 user / assistant,system 不重复注入
+            if role in ("user", "assistant") and text:
+                messages.append({"role": role, "content": text})
+        messages.append({"role": "user", "content": user_message})
         traces: list[ToolCallTrace] = []
         result = AgentResult(final_text="", traces=traces)
         last_task: TaskResult | None = None

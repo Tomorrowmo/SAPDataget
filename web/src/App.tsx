@@ -8,9 +8,12 @@ import Home from "./pages/Home";
 import SkillDetail from "./pages/SkillDetail";
 import Chat from "./pages/Chat";
 import Tasks from "./pages/Tasks";
+import TaskDetail from "./pages/TaskDetail";
 import AdminSkills from "./pages/AdminSkills";
+import AdminSkillEdit from "./pages/AdminSkillEdit";
 import AdminAudit from "./pages/AdminAudit";
 import AdminSensitive from "./pages/AdminSensitive";
+import AdminQuota from "./pages/AdminQuota";
 import MyLlmKeys from "./pages/MyLlmKeys";
 
 function Protected({ children }: { children: JSX.Element }) {
@@ -54,11 +57,15 @@ export default function App() {
                   <Route path="/" element={<Home />} />
                   <Route path="/skills/:skill_id" element={<SkillDetail />} />
                   <Route path="/chat" element={<Chat />} />
+                  <Route path="/chat/:task_id" element={<Chat />} />
                   <Route path="/tasks" element={<Tasks />} />
+                  <Route path="/tasks/:task_id" element={<TaskDetail />} />
                   <Route path="/llm-keys" element={<MyLlmKeys />} />
                   <Route path="/admin/skills" element={<AdminOnly><AdminSkills /></AdminOnly>} />
+                  <Route path="/admin/skills/:skill_id" element={<AdminOnly><AdminSkillEdit /></AdminOnly>} />
                   <Route path="/admin/audit" element={<AdminOnly><AdminAudit /></AdminOnly>} />
                   <Route path="/admin/sensitive" element={<AdminOnly><AdminSensitive /></AdminOnly>} />
+                  <Route path="/admin/quota" element={<AdminOnly><AdminQuota /></AdminOnly>} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
               </Layout>

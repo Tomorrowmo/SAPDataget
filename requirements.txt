@@ -19,6 +19,7 @@ uvicorn[standard]>=0.32.0
 pydantic>=2.5.0
 PyJWT>=2.8.0
 python-multipart>=0.0.6
+cryptography>=42.0.0     # AES-256-GCM for bw_creds (§14)
 
 # Tests
 pytest>=8.0.0

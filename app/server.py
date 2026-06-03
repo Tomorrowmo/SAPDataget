@@ -29,19 +29,25 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import (
+    Cookie, Depends, FastAPI, File, HTTPException, Request,
+    Response, UploadFile, status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.agent import Agent
+from app.task_bus import BUS as TASK_BUS
 from app.auth import (
     AuthError, Identity, clear_credentials, decode_jwt, get_credentials,
     issue_jwt, save_credentials, verify_bw_credentials,
@@ -81,8 +87,20 @@ def _bootstrap() -> None:
     STATE.skills = SkillRegistry(settings.skills_dir)
     STATE.skills.reload()
     STATE.llm = LLMClient(settings.llm)
-    STATE.orchestrator = TaskOrchestrator(settings, STATE.bw, STATE.skills)
     STATE.db = DB(settings.output_dir.parent / "app.sqlite3")
+
+    def _resolve_sensitive(svc: str) -> dict[str, str]:
+        # 从 DB 取该 service 的所有敏感字段 → {field: mask_mode}
+        out: dict[str, str] = {}
+        for row in STATE.db.list_sensitive_fields():
+            if row.get("service") == svc:
+                out[row["field"]] = row["mask_mode"]
+        return out
+
+    STATE.orchestrator = TaskOrchestrator(
+        settings, STATE.bw, STATE.skills,
+        sensitive_fields_resolver=_resolve_sensitive,
+    )
     # 注: 不再启动期把 key 灌 os.environ —— 现在 key 按用户隔离,
     #     每次 chat / test 调用时从 DB 取 当前用户 的 key 直接传给 LiteLLM。
     #     .env 中的 *_API_KEY 仍作为 fallback (无个人 key 时用)。
@@ -147,6 +165,7 @@ class RunSkillRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    task_id: str | None = None       # 提供则继续该 task 的多轮 (P1-11)
 
 
 class SensitiveFieldRequest(BaseModel):
@@ -187,7 +206,8 @@ def auth_login(req: LoginRequest, response: Response, request: Request) -> dict[
         identity = verify_bw_credentials(STATE.settings.bw, req.username, req.password)
     except AuthError as e:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(e))
-    save_credentials(identity.username, req.password)
+    cred_id = save_credentials(identity.username, req.password, db=STATE.db)
+    identity.cred_id = cred_id
     STATE.db.upsert_user(identity.username, identity.display_name, identity.role)
     token = issue_jwt(identity)
     response.set_cookie(
@@ -208,7 +228,7 @@ def auth_login(req: LoginRequest, response: Response, request: Request) -> dict[
 
 @app.post("/api/auth/logout")
 def auth_logout(response: Response, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
-    clear_credentials(identity.username)
+    clear_credentials(identity.username, cred_id=identity.cred_id, db=STATE.db)
     response.delete_cookie(COOKIE_NAME, path="/")
     STATE.db.write_audit(username=identity.username, action="logout")
     return {"ok": True}
@@ -431,11 +451,24 @@ def list_skills_endpoint(
     identity: Identity = Depends(current_identity),
 ) -> dict[str, Any]:
     keywords = [k for k in (q or "").split() if k]
-    skills = STATE.skills.list(keywords=keywords or None)
-    return {
-        "skills": [s.to_summary() for s in skills],
-        "total": len(skills),
-    }
+    # admin 看全部;非 admin 按 role 过滤 visible_to (§9.2 / P1-12)
+    role = None if identity.role == "admin" else identity.role
+    skills = STATE.skills.list(keywords=keywords or None, role=role)
+    # 注入 status + favorite 标记
+    statuses = {(r["skill_id"], r["version"]): r["status"]
+                for r in STATE.db.list_skill_statuses()}
+    fav_ids = {f["ref_id"] for f in STATE.db.list_favorites(identity.username, "skill")}
+    items: list[dict[str, Any]] = []
+    for s in skills:
+        st = statuses.get((s.id, s.version), "active")
+        # 非 admin 不展示 archived
+        if st == "archived" and identity.role != "admin":
+            continue
+        d = s.to_summary()
+        d["status"] = st
+        d["favorite"] = s.id in fav_ids
+        items.append(d)
+    return {"skills": items, "total": len(items)}
 
 
 @app.get("/api/skills/{skill_id}")
@@ -450,43 +483,56 @@ def get_skill_endpoint(
     return s.to_detail()
 
 
-@app.post("/api/skills/{skill_id}/run")
-def run_skill_endpoint(
+def _run_skill_task(
+    *,
     skill_id: str,
-    req: RunSkillRequest,
-    request: Request,
-    identity: Identity = Depends(current_identity),
+    params: dict[str, Any],
+    username: str,
+    source: str = "skill",
+    parent_task_id: str | None = None,
+    ip: str | None = None,
 ) -> dict[str, Any]:
+    """共用工作流: 创建 task → 跑 → 写文件 → 写审计 → 返回响应 dict。"""
     t0 = time.monotonic()
-    task_row = STATE.db.create_task(
-        username=identity.username, source="skill",
-        skill_id=skill_id, question=f"[skill] {skill_id}", params=req.params,
+    task_id = STATE.db.create_task(
+        username=username, source=source,
+        skill_id=skill_id, question=f"[skill] {skill_id}", params=params,
     )
+    # parent_task_id 落库 (用于重跑追溯)
+    if parent_task_id:
+        with STATE.db.cursor() as cur:
+            cur.execute("UPDATE tasks SET parent_task_id=? WHERE id=?",
+                        (parent_task_id, task_id))
+
+    TASK_BUS.publish(task_id, {"type": "started", "skill_id": skill_id, "params": params})
+    TASK_BUS.publish(task_id, {"type": "progress", "step": "running_skill"})
+
     result = STATE.orchestrator.run_skill(
-        skill_id, req.params,
-        username=identity.username, question=f"[skill] {skill_id}",
+        skill_id, params,
+        username=username, question=f"[skill] {skill_id}",
     )
     latency_ms = int((time.monotonic() - t0) * 1000)
     STATE.db.finish_task(
-        task_row, status=result.status, error=result.error,
+        task_id, status=result.status, error=result.error,
         row_count=result.row_count, latency_ms=latency_ms,
     )
     if result.status == "done" and result.excel:
         STATE.db.add_task_file(
-            task_row, filename=result.excel.path.name,
+            task_id, filename=result.excel.path.name,
             path=str(result.excel.path), size_bytes=result.excel.size_bytes,
             preview=result.rows_preview[:50],
         )
     STATE.db.write_audit(
-        username=identity.username, action="run_skill",
-        task_id=task_row,
+        username=username, action="run_skill",
+        task_id=task_id,
         service=result.meta.get("service") if result.meta else None,
         odata_url=result.meta.get("odata_url") if result.meta else None,
         row_count=result.row_count, latency_ms=latency_ms,
-        ip=request.client.host if request.client else None,
+        ip=ip,
     )
-    return {
-        "task_id": task_row,
+
+    payload = {
+        "task_id": task_id,
         "status": result.status,
         "error": result.error,
         "row_count": result.row_count,
@@ -494,10 +540,31 @@ def run_skill_endpoint(
         "excel": {
             "filename": result.excel.path.name,
             "size_bytes": result.excel.size_bytes,
-            "download_url": f"/api/tasks/{task_row}/file",
+            "download_url": f"/api/tasks/{task_id}/file",
         } if result.excel else None,
         "meta": result.meta,
     }
+    TASK_BUS.publish(task_id, {
+        "type": result.status,
+        "row_count": result.row_count,
+        "error": result.error,
+        "excel_filename": result.excel.path.name if result.excel else None,
+    })
+    return payload
+
+
+@app.post("/api/skills/{skill_id}/run")
+def run_skill_endpoint(
+    skill_id: str,
+    req: RunSkillRequest,
+    request: Request,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    return _run_skill_task(
+        skill_id=skill_id, params=req.params,
+        username=identity.username,
+        ip=request.client.host if request.client else None,
+    )
 
 
 # ============================== /api/services ==============================
@@ -532,15 +599,36 @@ def chat_endpoint(
     request: Request,
     identity: Identity = Depends(current_identity),
 ) -> dict[str, Any]:
-    """LLM 驱动的自由对话 (一期同步,二期 SSE 流式)。
+    """LLM 驱动的自由对话 (P0-6 / P1-11)。
 
-    用当前用户私有的 key 调 LLM。
+    多轮:若 ``task_id`` 已提供且属于当前用户 → 在同一 task 上追加;否则新建 task。
+    每条 user / assistant 消息都落 ``task_messages`` 表,供 GET /api/tasks/{id}/messages 查询。
     """
     t0 = time.monotonic()
-    task_id = STATE.db.create_task(
-        username=identity.username, source="chat",
-        question=req.message,
-    )
+    # 配额拦截 (P2-20)
+    from datetime import datetime as _dt
+    month = _dt.utcnow().strftime("%Y-%m")
+    limit = STATE.db.get_user_quota_limit(identity.username)
+    if limit is not None:
+        used = STATE.db.get_user_quota_usage(identity.username, month)
+        if used["input_tokens"] + used["output_tokens"] >= limit:
+            raise HTTPException(429, f"本月 LLM token 配额已用完 ({limit})。请联系管理员调整。")
+
+    # 多轮: 若用户带了 task_id 且属于自己,沿用;否则新建
+    task_id: str | None = None
+    if req.task_id:
+        row = STATE.db.get_task(req.task_id)
+        if row and row.get("username") == identity.username and row.get("source") == "chat":
+            task_id = req.task_id
+    if not task_id:
+        task_id = STATE.db.create_task(
+            username=identity.username, source="chat",
+            question=req.message,
+        )
+
+    # 落用户消息
+    STATE.db.add_task_message(task_id, role="user", text=req.message)
+    TASK_BUS.publish(task_id, {"type": "user_message", "text": req.message})
     # 取当前用户的有效 key (个人 > .env fallback)
     cur_env = next(
         (m.api_key_env for m in KNOWN_MODELS if m.id == STATE.llm.model), ""
@@ -572,11 +660,19 @@ def chat_endpoint(
     user_llm.model = STATE.llm.model
     user_llm.api_key = user_key
     user_llm.api_base = STATE.llm.api_base
+    # 加载历史 (排除刚加进去的当前 user 消息)
+    prior_msgs = STATE.db.list_task_messages(task_id)
+    history_text: list[tuple[str, str]] = []
+    for m in prior_msgs[:-1]:                         # 最后一条是刚加的 user message
+        if m.get("text"):
+            history_text.append((m["role"], m["text"]))
+
     agent = Agent(
         settings=STATE.settings, llm=user_llm, bw=STATE.bw,
         skills=STATE.skills, orchestrator=STATE.orchestrator,
+        on_event=lambda kind, payload: TASK_BUS.publish(task_id, {"type": kind, **payload}),
     )
-    result = agent.run(req.message, username=identity.username)
+    result = agent.run(req.message, username=identity.username, history=history_text)
     latency_ms = int((time.monotonic() - t0) * 1000)
     task_status = "done" if result.task and result.task.status == "done" else "failed"
     STATE.db.finish_task(
@@ -594,6 +690,31 @@ def chat_endpoint(
             path=str(result.task.excel.path), size_bytes=result.task.excel.size_bytes,
             preview=result.task.rows_preview[:50],
         )
+
+    # 落 assistant 消息 (含 tool_calls 块)
+    STATE.db.add_task_message(
+        task_id, role="assistant", text=result.final_text,
+        blocks={"tool_calls": [
+            {"name": t.name, "arguments": t.arguments, "is_error": t.is_error}
+            for t in result.traces
+        ], "task": {
+            "status": result.task.status if result.task else "failed",
+            "excel_filename": result.task.excel.path.name if result.task and result.task.excel else None,
+            "row_count": result.task.row_count if result.task else 0,
+        } if result.task else None},
+    )
+    TASK_BUS.publish(task_id, {
+        "type": "assistant_message", "text": result.final_text,
+        "iterations": result.iterations,
+    })
+
+    # 配额累加
+    STATE.db.add_user_quota_usage(
+        identity.username, month,
+        input_tokens=result.total_input_tokens,
+        output_tokens=result.total_output_tokens,
+    )
+
     STATE.db.write_audit(
         username=identity.username, action="chat",
         task_id=task_id, question=req.message,
@@ -717,6 +838,382 @@ def delete_sensitive_field(
 def reload_skills(_: Identity = Depends(require_admin)) -> dict[str, Any]:
     n = STATE.skills.reload()
     return {"loaded": n}
+
+
+# ============================== /api/tasks: rerun / delete / messages / stream ==============================
+
+
+class RerunRequest(BaseModel):
+    params: dict[str, Any] | None = None       # 可空 → 沿用原参数
+
+
+@app.post("/api/tasks/{task_id}/rerun")
+def rerun_task_endpoint(
+    task_id: str,
+    req: RerunRequest,
+    request: Request,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    """重新跑一遍历史 Skill 任务,可选改参数 (F5)。"""
+    row = STATE.db.get_task(task_id)
+    if not row or row.get("username") != identity.username:
+        raise HTTPException(404, "任务不存在")
+    if not row.get("skill_id"):
+        raise HTTPException(400, "只支持基于 Skill 的任务重跑")
+    # 合并原参 + 覆盖
+    try:
+        original_params = json.loads(row.get("params") or "{}")
+    except Exception:
+        original_params = {}
+    final_params = {**original_params, **(req.params or {})}
+    return _run_skill_task(
+        skill_id=row["skill_id"],
+        params=final_params,
+        username=identity.username,
+        source="rerun",
+        parent_task_id=task_id,
+        ip=request.client.host if request.client else None,
+    )
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task_endpoint(
+    task_id: str,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    """删除自己的任务 (含 messages / files cascade)。"""
+    ok = STATE.db.delete_task(task_id, identity.username)
+    if not ok:
+        raise HTTPException(404, "任务不存在")
+    return {"ok": True}
+
+
+@app.get("/api/tasks/{task_id}/messages")
+def list_task_messages_endpoint(
+    task_id: str,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    """加载某个 chat 任务的多轮历史 (P1-10)。"""
+    row = STATE.db.get_task(task_id)
+    if not row or row.get("username") != identity.username:
+        raise HTTPException(404, "任务不存在")
+    msgs = STATE.db.list_task_messages(task_id)
+    return {"task_id": task_id, "messages": msgs}
+
+
+@app.get("/api/tasks/{task_id}/stream")
+def stream_task_endpoint(
+    task_id: str,
+    identity: Identity = Depends(current_identity),
+):
+    """SSE 进度流 (P1-13)。"""
+    from fastapi.responses import StreamingResponse
+    row = STATE.db.get_task(task_id)
+    if not row or row.get("username") != identity.username:
+        raise HTTPException(404, "任务不存在")
+
+    def _gen():
+        # 终态任务: 一次性把 DB 状态发完即关
+        if row.get("status") in ("done", "failed"):
+            payload = {
+                "type": row["status"],
+                "row_count": row.get("row_count") or 0,
+                "error": row.get("error"),
+                "excel_filename": row.get("filename"),
+            }
+            yield f"event: {payload['type']}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            return
+        # 跑中: 走 TaskBus
+        for ev in TASK_BUS.stream(task_id, timeout_seconds=120, idle_tick=10):
+            etype = ev.get("type", "message")
+            yield f"event: {etype}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+# ============================== /api/favorites (P1-9) ==============================
+
+
+class FavoriteRequest(BaseModel):
+    kind: str                                # skill | task
+    ref_id: str
+
+
+@app.get("/api/favorites")
+def list_favorites_endpoint(
+    kind: str | None = None,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    rows = STATE.db.list_favorites(identity.username, kind=kind)
+    return {"favorites": rows, "total": len(rows)}
+
+
+@app.post("/api/favorites")
+def add_favorite_endpoint(
+    req: FavoriteRequest,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    if req.kind not in ("skill", "task"):
+        raise HTTPException(400, "kind 必须是 skill 或 task")
+    STATE.db.add_favorite(identity.username, req.kind, req.ref_id)
+    return {"ok": True}
+
+
+@app.delete("/api/favorites/{kind}/{ref_id}")
+def remove_favorite_endpoint(
+    kind: str, ref_id: str,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    STATE.db.remove_favorite(identity.username, kind, ref_id)
+    return {"ok": True}
+
+
+# ============================== /api/admin/skills CRUD (P1-7) ==============================
+
+
+class SkillCreateRequest(BaseModel):
+    id: str
+    skill_md: str
+    service_yaml: str
+
+
+class SkillUpdateRequest(BaseModel):
+    skill_md: str | None = None
+    service_yaml: str | None = None
+
+
+class SkillTestRunRequest(BaseModel):
+    params: dict[str, Any]
+
+
+_SAFE_SKILL_ID = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+
+
+def _skill_folder(skill_id: str) -> Path:
+    if not _SAFE_SKILL_ID.match(skill_id):
+        raise HTTPException(400, "skill id 必须 ^[a-z][a-z0-9_]{1,40}$")
+    return STATE.settings.skills_dir / skill_id
+
+
+@app.post("/api/admin/skills")
+def admin_create_skill(
+    req: SkillCreateRequest,
+    _: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    folder = _skill_folder(req.id)
+    if folder.exists():
+        raise HTTPException(409, f"Skill {req.id} 已存在")
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "SKILL.md").write_text(req.skill_md, encoding="utf-8")
+    (folder / "service.yaml").write_text(req.service_yaml, encoding="utf-8")
+    STATE.skills.reload()
+    return {"ok": True, "id": req.id}
+
+
+@app.put("/api/admin/skills/{skill_id}")
+def admin_update_skill(
+    skill_id: str,
+    req: SkillUpdateRequest,
+    _: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    folder = _skill_folder(skill_id)
+    if not folder.exists():
+        raise HTTPException(404, "Skill 不存在")
+    if req.skill_md is not None:
+        (folder / "SKILL.md").write_text(req.skill_md, encoding="utf-8")
+    if req.service_yaml is not None:
+        (folder / "service.yaml").write_text(req.service_yaml, encoding="utf-8")
+    STATE.skills.reload()
+    return {"ok": True}
+
+
+@app.delete("/api/admin/skills/{skill_id}")
+def admin_delete_skill(
+    skill_id: str,
+    _: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    folder = _skill_folder(skill_id)
+    if not folder.exists():
+        raise HTTPException(404, "Skill 不存在")
+    import shutil
+    shutil.rmtree(folder)
+    STATE.skills.reload()
+    return {"ok": True}
+
+
+@app.get("/api/admin/skills/{skill_id}/source")
+def admin_get_skill_source(
+    skill_id: str,
+    _: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    """读 SKILL.md + service.yaml 原文 (供编辑器初始化)。"""
+    folder = _skill_folder(skill_id)
+    if not folder.exists():
+        raise HTTPException(404, "Skill 不存在")
+    skill_md = (folder / "SKILL.md").read_text(encoding="utf-8") if (folder / "SKILL.md").exists() else ""
+    service_yaml = (folder / "service.yaml").read_text(encoding="utf-8") if (folder / "service.yaml").exists() else ""
+    has_template = (folder / "template.xlsx").exists()
+    has_chart = (folder / "chart.json").exists()
+    return {
+        "id": skill_id, "skill_md": skill_md, "service_yaml": service_yaml,
+        "has_template": has_template, "has_chart": has_chart,
+    }
+
+
+@app.post("/api/admin/skills/{skill_id}/files/template")
+async def admin_upload_template(
+    skill_id: str,
+    file: UploadFile = File(...),
+    _: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    """上传 template.xlsx;先做安全扫描 (拒绝 VBA) (P2-16)。"""
+    folder = _skill_folder(skill_id)
+    if not folder.exists():
+        raise HTTPException(404, "Skill 不存在")
+    if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(400, "只接受 .xlsx (.xlsm 含宏将被拒绝)")
+    target = folder / "template.xlsx"
+    content = await file.read()
+    target.write_bytes(content)
+    try:
+        from app.excel.builder import scan_template_safety, TemplateScanError
+        scan_template_safety(target)
+    except TemplateScanError as e:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, str(e))
+    return {"ok": True, "size_bytes": len(content)}
+
+
+@app.delete("/api/admin/skills/{skill_id}/files/template")
+def admin_delete_template(
+    skill_id: str,
+    _: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    folder = _skill_folder(skill_id)
+    p = folder / "template.xlsx"
+    if p.exists():
+        p.unlink()
+    return {"ok": True}
+
+
+class ChartJsonRequest(BaseModel):
+    chart: dict[str, Any]
+
+
+@app.put("/api/admin/skills/{skill_id}/chart")
+def admin_set_chart(
+    skill_id: str,
+    req: ChartJsonRequest,
+    _: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    folder = _skill_folder(skill_id)
+    if not folder.exists():
+        raise HTTPException(404, "Skill 不存在")
+    (folder / "chart.json").write_text(
+        json.dumps(req.chart, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return {"ok": True}
+
+
+@app.delete("/api/admin/skills/{skill_id}/chart")
+def admin_delete_chart(
+    skill_id: str,
+    _: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    p = _skill_folder(skill_id) / "chart.json"
+    if p.exists():
+        p.unlink()
+    return {"ok": True}
+
+
+@app.post("/api/admin/skills/{skill_id}/test-run")
+def admin_test_run_skill(
+    skill_id: str,
+    req: SkillTestRunRequest,
+    request: Request,
+    identity: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    """管理员试运行,不写审计 (不污染统计),但走完整生成流程。"""
+    if skill_id not in {s.id for s in STATE.skills.list()}:
+        STATE.skills.reload()
+    if skill_id not in {s.id for s in STATE.skills.list()}:
+        raise HTTPException(404, f"未找到 Skill: {skill_id}")
+    result = STATE.orchestrator.run_skill(
+        skill_id, req.params,
+        username=f"_test_{identity.username}",
+        question=f"[test-run] {skill_id}",
+    )
+    return {
+        "status": result.status,
+        "error": result.error,
+        "row_count": result.row_count,
+        "rows_preview": result.rows_preview[:20],
+        "warnings": result.excel.warnings if result.excel else [],
+        "meta": result.meta,
+    }
+
+
+class SkillStatusRequest(BaseModel):
+    status: str                                # active | deprecated | archived | draft
+
+
+@app.patch("/api/admin/skills/{skill_id}/status")
+def admin_set_skill_status(
+    skill_id: str,
+    req: SkillStatusRequest,
+    identity: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    """切换 Skill 生命周期状态 (§9.5, P2-19)。"""
+    if req.status not in ("draft", "active", "deprecated", "archived"):
+        raise HTTPException(400, "status 必须是 draft / active / deprecated / archived")
+    try:
+        s = STATE.skills.get(skill_id)
+    except KeyError:
+        raise HTTPException(404, "Skill 不存在")
+    STATE.db.set_skill_status(s.id, s.version, req.status, changed_by=identity.username)
+    return {"ok": True, "id": s.id, "version": s.version, "status": req.status}
+
+
+# ============================== /api/admin/quota (P2-20) ==============================
+
+
+class QuotaLimitRequest(BaseModel):
+    monthly_tokens: int | None                 # None = 取消限制
+
+
+@app.get("/api/admin/quota")
+def admin_list_quota(_: Identity = Depends(require_admin)) -> dict[str, Any]:
+    rows = STATE.db.list_quota_status()
+    return {"quota": rows, "total": len(rows)}
+
+
+@app.put("/api/admin/quota/{username}")
+def admin_set_quota(
+    username: str,
+    req: QuotaLimitRequest,
+    identity: Identity = Depends(require_admin),
+) -> dict[str, Any]:
+    if req.monthly_tokens is not None and req.monthly_tokens < 0:
+        raise HTTPException(400, "monthly_tokens 不可为负")
+    STATE.db.set_user_quota_limit(username, req.monthly_tokens, set_by=identity.username)
+    return {"ok": True}
+
+
+@app.get("/api/quota/me")
+def my_quota_endpoint(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+    from datetime import datetime as _dt
+    month = _dt.utcnow().strftime("%Y-%m")
+    usage = STATE.db.get_user_quota_usage(identity.username, month)
+    limit = STATE.db.get_user_quota_limit(identity.username)
+    return {
+        "month": month,
+        "usage": usage,
+        "limit_tokens": limit,
+        "remaining": (max(0, limit - usage["input_tokens"] - usage["output_tokens"])
+                      if limit is not None else None),
+    }
 
 
 # ============================== 静态前端 ==============================

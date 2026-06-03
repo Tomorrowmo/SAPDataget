@@ -32,6 +32,12 @@ server.log
 server.log.err
 *.log
 
+# 测试用临时 skill 目录 (admin CRUD 测试自动生成,正常会自清,失败时残留)
+data/skills/test_temp_skill_*/
+data/skills/test_tpl_*/
+data/skills/test_chart_*/
+data/skills/test_visible_*/
+
 # ---------- Frontend ----------
 web/node_modules/
 web/dist/

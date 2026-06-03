@@ -2,6 +2,7 @@
 import type {
   Identity, LlmStatus, SkillSummary, SkillDetail, SkillRunResponse,
   ChatResponse, TaskListItem, AuditRow, SensitiveField, SystemStatus, BWService,
+  Favorite, TaskMessage, QuotaStatus, AdminQuotaRow, SkillSourceResp,
 } from "./types";
 
 class ApiError extends Error {
@@ -107,8 +108,8 @@ export const api = {
     ),
 
   // ---------- chat ----------
-  chat: (message: string) =>
-    request<ChatResponse>("POST", "/api/chat", { message }),
+  chat: (message: string, task_id?: string) =>
+    request<ChatResponse>("POST", "/api/chat", { message, task_id }),
 
   // ---------- tasks ----------
   listTasks: () =>
@@ -119,6 +120,35 @@ export const api = {
       `/api/tasks/${id}`,
     ),
   downloadTaskUrl: (id: string) => `/api/tasks/${id}/file`,
+  rerunTask: (id: string, params?: Record<string, unknown>) =>
+    request<SkillRunResponse>("POST", `/api/tasks/${id}/rerun`, { params: params ?? null }),
+  deleteTask: (id: string) =>
+    request<{ ok: boolean }>("DELETE", `/api/tasks/${id}`),
+  taskMessages: (id: string) =>
+    request<{ task_id: string; messages: TaskMessage[] }>("GET", `/api/tasks/${id}/messages`),
+  taskStreamUrl: (id: string) => `/api/tasks/${id}/stream`,
+
+  // ---------- favorites ----------
+  listFavorites: (kind?: "skill" | "task") =>
+    request<{ favorites: Favorite[]; total: number }>(
+      "GET", `/api/favorites${kind ? `?kind=${kind}` : ""}`,
+    ),
+  addFavorite: (kind: "skill" | "task", ref_id: string) =>
+    request<{ ok: boolean }>("POST", "/api/favorites", { kind, ref_id }),
+  removeFavorite: (kind: "skill" | "task", ref_id: string) =>
+    request<{ ok: boolean }>(
+      "DELETE",
+      `/api/favorites/${kind}/${encodeURIComponent(ref_id)}`,
+    ),
+
+  // ---------- quota ----------
+  myQuota: () => request<QuotaStatus>("GET", "/api/quota/me"),
+  adminListQuota: () =>
+    request<{ quota: AdminQuotaRow[]; total: number }>("GET", "/api/admin/quota"),
+  adminSetQuota: (username: string, monthly_tokens: number | null) =>
+    request<{ ok: boolean }>("PUT", `/api/admin/quota/${encodeURIComponent(username)}`, {
+      monthly_tokens,
+    }),
 
   // ---------- admin ----------
   listAudit: (params?: { username?: string; action?: string; limit?: number }) => {
@@ -144,6 +174,51 @@ export const api = {
     ),
   reloadSkills: () =>
     request<{ loaded: number }>("POST", "/api/admin/skills/reload"),
+
+  // ---------- admin: skill CRUD ----------
+  adminCreateSkill: (id: string, skill_md: string, service_yaml: string) =>
+    request<{ ok: boolean; id: string }>("POST", "/api/admin/skills",
+      { id, skill_md, service_yaml }),
+  adminUpdateSkill: (id: string, skill_md?: string, service_yaml?: string) =>
+    request<{ ok: boolean }>("PUT", `/api/admin/skills/${encodeURIComponent(id)}`,
+      { skill_md, service_yaml }),
+  adminDeleteSkill: (id: string) =>
+    request<{ ok: boolean }>("DELETE", `/api/admin/skills/${encodeURIComponent(id)}`),
+  adminSkillSource: (id: string) =>
+    request<SkillSourceResp>("GET", `/api/admin/skills/${encodeURIComponent(id)}/source`),
+  adminUploadTemplate: async (id: string, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const resp = await fetch(`/api/admin/skills/${encodeURIComponent(id)}/files/template`, {
+      method: "POST", credentials: "include", body: fd,
+    });
+    if (!resp.ok) {
+      let msg = `${resp.status}`;
+      try { const j = await resp.json(); msg = j?.detail || msg; } catch {}
+      throw new ApiError(resp.status, msg);
+    }
+    return (await resp.json()) as { ok: boolean; size_bytes: number };
+  },
+  adminDeleteTemplate: (id: string) =>
+    request<{ ok: boolean }>("DELETE", `/api/admin/skills/${encodeURIComponent(id)}/files/template`),
+  adminSetChart: (id: string, chart: Record<string, unknown>) =>
+    request<{ ok: boolean }>("PUT", `/api/admin/skills/${encodeURIComponent(id)}/chart`, { chart }),
+  adminDeleteChart: (id: string) =>
+    request<{ ok: boolean }>("DELETE", `/api/admin/skills/${encodeURIComponent(id)}/chart`),
+  adminTestRunSkill: (id: string, params: Record<string, unknown>) =>
+    request<{
+      status: "done" | "failed"; error?: string | null; row_count: number;
+      rows_preview: Record<string, unknown>[]; warnings: string[];
+      meta?: Record<string, unknown>;
+    }>("POST", `/api/admin/skills/${encodeURIComponent(id)}/test-run`, { params }),
+  adminSetSkillStatus: (
+    id: string,
+    skill_status: "draft" | "active" | "deprecated" | "archived",
+  ) => request<{ ok: boolean }>(
+    "PATCH",
+    `/api/admin/skills/${encodeURIComponent(id)}/status`,
+    { status: skill_status },
+  ),
 };
 
 export { ApiError };

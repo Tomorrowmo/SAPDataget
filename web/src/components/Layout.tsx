@@ -23,6 +23,7 @@ export default function Layout({ children }: { children: ReactNode }) {
     { to: "/admin/skills", label: "🛠 Skill 管理" },
     { to: "/admin/audit", label: "🔍 审计日志" },
     { to: "/admin/sensitive", label: "🔒 敏感字段" },
+    { to: "/admin/quota", label: "📊 LLM 配额" },
   ];
 
   return (

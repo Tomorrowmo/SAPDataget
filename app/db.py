@@ -94,6 +94,66 @@ CREATE TABLE IF NOT EXISTS llm_api_keys (
   updated_at  TEXT DEFAULT (datetime('now')),
   PRIMARY KEY (username, env_var)
 );
+
+-- 自由对话/多轮的消息历史 (一个 task = 一段会话)
+CREATE TABLE IF NOT EXISTS task_messages (
+  id           TEXT PRIMARY KEY,
+  task_id      TEXT NOT NULL,
+  role         TEXT NOT NULL,                -- user | assistant | system
+  text         TEXT,
+  blocks_json  TEXT,                          -- 工具调用 / 表格等结构化块
+  created_at   TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_taskmsg_task_time ON task_messages(task_id, created_at);
+
+-- 收藏 (F7)
+CREATE TABLE IF NOT EXISTS favorites (
+  username    TEXT NOT NULL,
+  kind        TEXT NOT NULL,                 -- skill | task
+  ref_id      TEXT NOT NULL,
+  created_at  TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (username, kind, ref_id)
+);
+
+-- 加密 BW 凭据 (§14 二期; v0.3 用 AES-256-GCM,密钥从 BW_CRED_KEY env 取)
+CREATE TABLE IF NOT EXISTS bw_creds (
+  cred_id     TEXT PRIMARY KEY,
+  username    TEXT NOT NULL,
+  ciphertext  BLOB NOT NULL,
+  nonce       BLOB NOT NULL,
+  expires_at  TEXT NOT NULL,
+  created_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_bwcreds_user ON bw_creds(username);
+
+-- Skill 生命周期 (§9.5 draft/active/deprecated/archived)
+CREATE TABLE IF NOT EXISTS skill_status (
+  skill_id    TEXT NOT NULL,
+  version     INTEGER NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'active',  -- draft | active | deprecated | archived
+  changed_at  TEXT DEFAULT (datetime('now')),
+  changed_by  TEXT,
+  PRIMARY KEY (skill_id, version)
+);
+
+-- Per-user LLM token 配额 (§7.8 风险缓解)
+CREATE TABLE IF NOT EXISTS llm_quota (
+  username       TEXT NOT NULL,
+  month          TEXT NOT NULL,                -- YYYY-MM
+  input_tokens   INTEGER NOT NULL DEFAULT 0,
+  output_tokens  INTEGER NOT NULL DEFAULT 0,
+  call_count     INTEGER NOT NULL DEFAULT 0,
+  updated_at     TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (username, month)
+);
+
+CREATE TABLE IF NOT EXISTS llm_quota_limits (
+  username       TEXT PRIMARY KEY,
+  monthly_tokens INTEGER,                       -- NULL = 无限
+  set_by         TEXT,
+  updated_at     TEXT DEFAULT (datetime('now'))
+);
 """
 
 
@@ -330,3 +390,201 @@ class DB:
                 "DELETE FROM llm_api_keys WHERE username=? AND env_var=?",
                 (username, env_var),
             )
+
+    # ---------- task messages (自由对话多轮) ----------
+    def add_task_message(
+        self, task_id: str, *, role: str, text: str = "",
+        blocks: Any | None = None,
+    ) -> str:
+        msg_id = "m_" + uuid.uuid4().hex[:10]
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO task_messages(id, task_id, role, text, blocks_json) "
+                "VALUES(?,?,?,?,?)",
+                (msg_id, task_id, role, text,
+                 json.dumps(blocks, ensure_ascii=False, default=str) if blocks is not None else None),
+            )
+        return msg_id
+
+    def list_task_messages(self, task_id: str) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            rows = cur.execute(
+                "SELECT * FROM task_messages WHERE task_id=? ORDER BY created_at",
+                (task_id,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            if d.get("blocks_json"):
+                try:
+                    d["blocks"] = json.loads(d.pop("blocks_json"))
+                except Exception:
+                    d["blocks"] = None
+            else:
+                d.pop("blocks_json", None)
+                d["blocks"] = None
+            out.append(d)
+        return out
+
+    # ---------- favorites ----------
+    def add_favorite(self, username: str, kind: str, ref_id: str) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO favorites(username, kind, ref_id) VALUES(?,?,?)",
+                (username, kind, ref_id),
+            )
+
+    def remove_favorite(self, username: str, kind: str, ref_id: str) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "DELETE FROM favorites WHERE username=? AND kind=? AND ref_id=?",
+                (username, kind, ref_id),
+            )
+
+    def list_favorites(self, username: str, kind: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM favorites WHERE username=?"
+        params: list[Any] = [username]
+        if kind:
+            sql += " AND kind=?"
+            params.append(kind)
+        sql += " ORDER BY created_at DESC"
+        with self.cursor() as cur:
+            return [dict(r) for r in cur.execute(sql, params).fetchall()]
+
+    def is_favorite(self, username: str, kind: str, ref_id: str) -> bool:
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT 1 FROM favorites WHERE username=? AND kind=? AND ref_id=?",
+                (username, kind, ref_id),
+            ).fetchone()
+            return bool(row)
+
+    # ---------- BW creds (AES-256-GCM, §14) ----------
+    def save_bw_cred(
+        self, *, username: str, ciphertext: bytes, nonce: bytes, ttl_seconds: int,
+    ) -> str:
+        from datetime import timedelta
+        cred_id = "c_" + uuid.uuid4().hex[:16]
+        expires = (datetime.utcnow() + timedelta(seconds=ttl_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bw_creds(cred_id, username, ciphertext, nonce, expires_at) "
+                "VALUES(?,?,?,?,?)",
+                (cred_id, username, ciphertext, nonce, expires),
+            )
+        return cred_id
+
+    def get_bw_cred(self, cred_id: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT cred_id, username, ciphertext, nonce, expires_at FROM bw_creds "
+                "WHERE cred_id=? AND expires_at > datetime('now')",
+                (cred_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def delete_bw_cred(self, cred_id: str) -> None:
+        with self.cursor() as cur:
+            cur.execute("DELETE FROM bw_creds WHERE cred_id=?", (cred_id,))
+
+    def cleanup_expired_bw_creds(self) -> int:
+        with self.cursor() as cur:
+            cur.execute("DELETE FROM bw_creds WHERE expires_at <= datetime('now')")
+            return cur.rowcount
+
+    # ---------- Skill status ----------
+    def set_skill_status(
+        self, skill_id: str, version: int, status: str, changed_by: str = "",
+    ) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO skill_status(skill_id, version, status, changed_at, changed_by) "
+                "VALUES(?,?,?,datetime('now'),?) "
+                "ON CONFLICT(skill_id, version) DO UPDATE SET status=excluded.status, "
+                "  changed_at=datetime('now'), changed_by=excluded.changed_by",
+                (skill_id, version, status, changed_by),
+            )
+
+    def get_skill_status(self, skill_id: str, version: int) -> str:
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT status FROM skill_status WHERE skill_id=? AND version=?",
+                (skill_id, version),
+            ).fetchone()
+            return row["status"] if row else "active"
+
+    def list_skill_statuses(self) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            return [dict(r) for r in cur.execute(
+                "SELECT * FROM skill_status ORDER BY skill_id, version DESC").fetchall()]
+
+    # ---------- LLM quota ----------
+    def get_user_quota_usage(self, username: str, month: str) -> dict[str, int]:
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT input_tokens, output_tokens, call_count "
+                "FROM llm_quota WHERE username=? AND month=?",
+                (username, month),
+            ).fetchone()
+        if not row:
+            return {"input_tokens": 0, "output_tokens": 0, "call_count": 0}
+        return dict(row)
+
+    def add_user_quota_usage(
+        self, username: str, month: str, *,
+        input_tokens: int = 0, output_tokens: int = 0,
+    ) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO llm_quota(username, month, input_tokens, output_tokens, call_count, updated_at) "
+                "VALUES(?,?,?,?,1, datetime('now')) "
+                "ON CONFLICT(username, month) DO UPDATE SET "
+                "  input_tokens=input_tokens + excluded.input_tokens, "
+                "  output_tokens=output_tokens + excluded.output_tokens, "
+                "  call_count=call_count + 1, "
+                "  updated_at=datetime('now')",
+                (username, month, input_tokens, output_tokens),
+            )
+
+    def get_user_quota_limit(self, username: str) -> int | None:
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT monthly_tokens FROM llm_quota_limits WHERE username=?",
+                (username,),
+            ).fetchone()
+            return row["monthly_tokens"] if row else None
+
+    def set_user_quota_limit(
+        self, username: str, monthly_tokens: int | None, set_by: str = "",
+    ) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO llm_quota_limits(username, monthly_tokens, set_by, updated_at) "
+                "VALUES(?,?,?, datetime('now')) "
+                "ON CONFLICT(username) DO UPDATE SET monthly_tokens=excluded.monthly_tokens, "
+                "  set_by=excluded.set_by, updated_at=datetime('now')",
+                (username, monthly_tokens, set_by),
+            )
+
+    def list_quota_status(self) -> list[dict[str, Any]]:
+        """All users' current-month usage + their limit (for admin)."""
+        from datetime import datetime as _dt
+        month = _dt.utcnow().strftime("%Y-%m")
+        with self.cursor() as cur:
+            rows = cur.execute(
+                "SELECT q.username, q.input_tokens, q.output_tokens, q.call_count, "
+                "       l.monthly_tokens AS limit_tokens "
+                "FROM llm_quota q LEFT JOIN llm_quota_limits l ON l.username=q.username "
+                "WHERE q.month=? ORDER BY (q.input_tokens + q.output_tokens) DESC",
+                (month,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_task(self, task_id: str, username: str) -> bool:
+        """Delete a task (and cascade messages/files) — only the owning user can delete."""
+        with self.cursor() as cur:
+            cur.execute(
+                "DELETE FROM tasks WHERE id=? AND username=?",
+                (task_id, username),
+            )
+            return cur.rowcount > 0

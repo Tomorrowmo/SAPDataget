@@ -1,5 +1,6 @@
-// 管理员 — Skill 管理：列表 + 详情查看 + reload
+// 管理员 — Skill 管理：列表 + 详情查看 + 新建/编辑/删除 + reload
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api";
 import type { SkillSummary, SkillDetail } from "../types";
 
@@ -36,16 +37,24 @@ export default function AdminSkills() {
         <div>
           <h1 className="text-2xl font-semibold text-zinc-900">🛠 Skill 管理</h1>
           <p className="text-sm text-zinc-500 mt-1">
-            Skill 文件放在 <code>data/skills/&lt;id&gt;/</code> 下,编辑后点重新加载。
+            Skill 文件放在 <code>data/skills/&lt;id&gt;/</code> 下;支持网页编辑、上传模板、试运行。
           </p>
         </div>
-        <button
-          onClick={reload}
-          disabled={busy}
-          className="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm rounded-md disabled:opacity-50"
-        >
-          {busy ? "..." : "🔄 重新加载"}
-        </button>
+        <div className="flex items-center gap-2">
+          <Link
+            to="/admin/skills/_new"
+            className="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm rounded-md"
+          >
+            + 新建 Skill
+          </Link>
+          <button
+            onClick={reload}
+            disabled={busy}
+            className="px-4 py-2 border border-zinc-300 hover:bg-zinc-50 text-sm rounded-md disabled:opacity-50"
+          >
+            {busy ? "..." : "🔄 重新加载"}
+          </button>
+        </div>
       </div>
 
       {msg && (
@@ -56,17 +65,33 @@ export default function AdminSkills() {
         <div className="col-span-5">
           <div className="bg-white border border-zinc-200 rounded-lg divide-y divide-zinc-100">
             {skills.map((s) => (
-              <button
-                key={s.id}
-                onClick={() => api.getSkill(s.id).then(setDetail)}
-                className={`w-full text-left p-4 hover:bg-zinc-50 transition ${
-                  detail?.id === s.id ? "bg-brand-50" : ""
-                }`}
-              >
-                <div className="font-medium text-zinc-900">{s.title}</div>
-                <div className="text-xs text-zinc-400 font-mono">{s.id}</div>
-                <div className="text-xs text-zinc-500 mt-1">{s.params.length} 参数</div>
-              </button>
+              <div key={s.id} className={`p-4 hover:bg-zinc-50 transition ${detail?.id === s.id ? "bg-brand-50" : ""}`}>
+                <button
+                  onClick={() => api.getSkill(s.id).then(setDetail)}
+                  className="w-full text-left"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="font-medium text-zinc-900">{s.title}</div>
+                    {s.status && s.status !== "active" && (
+                      <span className={`text-xs px-1.5 py-0.5 rounded ${
+                        s.status === "draft" ? "bg-amber-100 text-amber-700" :
+                        s.status === "deprecated" ? "bg-zinc-200 text-zinc-600" :
+                        "bg-red-100 text-red-700"
+                      }`}>{s.status}</span>
+                    )}
+                  </div>
+                  <div className="text-xs text-zinc-400 font-mono">{s.id}</div>
+                  <div className="text-xs text-zinc-500 mt-1">{s.params.length} 参数</div>
+                </button>
+                <div className="mt-2 flex gap-2">
+                  <Link
+                    to={`/admin/skills/${s.id}`}
+                    className="text-xs text-brand-600 hover:underline"
+                  >
+                    ✏️ 编辑/试运行
+                  </Link>
+                </div>
+              </div>
             ))}
           </div>
         </div>

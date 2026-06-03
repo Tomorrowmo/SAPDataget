@@ -32,7 +32,9 @@ pytestmark = pytest.mark.skipif(not _server_up(), reason="uvicorn 未启动")
 
 @pytest.fixture
 def client():
-    with httpx.Client(base_url=BASE_URL, timeout=30.0) as c:
+    # Windows 上 httpx keep-alive 偶尔被远端强关 → 配置传输层重试
+    transport = httpx.HTTPTransport(retries=3)
+    with httpx.Client(base_url=BASE_URL, timeout=30.0, transport=transport) as c:
         yield c
 
 

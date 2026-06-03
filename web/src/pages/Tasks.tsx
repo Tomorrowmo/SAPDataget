@@ -69,17 +69,18 @@ export default function Tasks() {
                       {r.status}
                     </span>
                   </td>
-                  <td className="px-3 py-2 text-center">
-                    {r.file_path ? (
+                  <td className="px-3 py-2 text-center whitespace-nowrap">
+                    <Link to={`/tasks/${r.id}`} className="text-brand-600 hover:underline text-xs mr-2">
+                      详情
+                    </Link>
+                    {r.file_path && (
                       <a
                         href={api.downloadTaskUrl(r.id)}
                         download={r.filename ?? undefined}
                         className="text-brand-600 hover:underline text-xs"
                       >
-                        ⬇ 下载
+                        ⬇
                       </a>
-                    ) : (
-                      <span className="text-zinc-300 text-xs">—</span>
                     )}
                   </td>
                 </tr>

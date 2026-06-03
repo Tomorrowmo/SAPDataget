@@ -19,7 +19,7 @@ from typing import Any
 
 from app.bw.interface import BWClient
 from app.config import Settings
-from app.excel.builder import ExcelBuilder, ExcelResult
+from app.excel.builder import ExcelBuilder, ExcelResult, load_chart_config
 from app.skills.registry import SkillRegistry
 from app.skills.runner import SkillRunner
 from app.skills.schema import Skill
@@ -46,12 +46,26 @@ class TaskOrchestrator:
         settings: Settings,
         bw: BWClient,
         skills: SkillRegistry,
+        sensitive_fields_resolver: Any | None = None,
     ) -> None:
+        """sensitive_fields_resolver: 可选回调 (service: str) -> dict[field, mask_mode]。
+        允许 server 注入 DB-backed 的脱敏配置;CLI 不传则不脱敏。
+        """
         self.settings = settings
         self.bw = bw
         self.skills = skills
         self.skill_runner = SkillRunner(bw)
         self.excel = ExcelBuilder(settings.output_dir)
+        self._sensitive_resolver = sensitive_fields_resolver
+
+    def _resolve_sensitive(self, service: str) -> dict[str, str]:
+        if self._sensitive_resolver is None or not service:
+            return {}
+        try:
+            return self._sensitive_resolver(service) or {}
+        except Exception as e:                                # noqa: BLE001
+            log.warning("敏感字段解析失败 service=%s: %s", service, e)
+            return {}
 
     # ---------- Skill 驱动路径（高频） ----------
     def run_skill(
@@ -108,6 +122,12 @@ class TaskOrchestrator:
             "rendered_filter": result.rendered_filter,
         }
         filename = _filename(skill.id, username)
+        template_path = None
+        if skill.folder_path:
+            t = Path(skill.folder_path) / "template.xlsx"
+            if t.exists():
+                template_path = t
+        chart_cfg = load_chart_config(skill.folder_path)
         excel_result = self.excel.build(
             filename=filename,
             columns=columns,
@@ -115,6 +135,9 @@ class TaskOrchestrator:
             labels=labels,
             info=info,
             sheet_name=skill.sheet_title,
+            sensitive_fields=self._resolve_sensitive(skill.service),
+            template_path=template_path,
+            chart=chart_cfg,
         )
 
         return TaskResult(
@@ -148,6 +171,7 @@ class TaskOrchestrator:
             labels=None,
             info={**info, "bw_mode": self.settings.bw.mode, "username": username},
             sheet_name=sheet_title,
+            sensitive_fields=self._resolve_sensitive(service),
         )
         return TaskResult(
             task_id=task_id,

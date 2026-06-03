@@ -1,7 +1,8 @@
-// 自由对话页 —— 走 LLM
-import { useState } from "react";
+// 自由对话页 —— 走 LLM (P1-11: 支持多轮 /chat/:task_id)
+import { useEffect, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
-import type { ChatResponse } from "../types";
+import type { ChatResponse, TaskMessage } from "../types";
 import DataTable from "../components/DataTable";
 import ExcelCard from "../components/ExcelCard";
 import { useAuth } from "../auth";
@@ -15,11 +16,28 @@ interface Turn {
 
 export default function Chat() {
   const { status } = useAuth();
+  const { task_id: routeTaskId } = useParams();
+  const navigate = useNavigate();
   const [input, setInput] = useState("");
   const [turns, setTurns] = useState<Turn[]>([]);
   const [busy, setBusy] = useState(false);
+  const [activeTask, setActiveTask] = useState<string | null>(routeTaskId || null);
 
   const llmReady = status?.llm.current_ready ?? false;
+
+  // 路由切换时加载历史
+  useEffect(() => {
+    setActiveTask(routeTaskId || null);
+    if (!routeTaskId) { setTurns([]); return; }
+    (async () => {
+      try {
+        const { messages } = await api.taskMessages(routeTaskId);
+        setTurns(messagesToTurns(messages));
+      } catch {
+        setTurns([]);
+      }
+    })();
+  }, [routeTaskId]);
 
   const send = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -29,7 +47,12 @@ export default function Chat() {
     setBusy(true);
     setTurns((ts) => [...ts, { user: msg, pending: true }]);
     try {
-      const r = await api.chat(msg);
+      const r = await api.chat(msg, activeTask || undefined);
+      // 首次回复 → 把 url 切到 /chat/:task_id (沉淀对话)
+      if (!activeTask && r.task_id) {
+        setActiveTask(r.task_id);
+        navigate(`/chat/${r.task_id}`, { replace: true });
+      }
       setTurns((ts) =>
         ts.map((t, i) => (i === ts.length - 1 ? { ...t, resp: r, pending: false } : t)),
       );
@@ -45,7 +68,11 @@ export default function Chat() {
     }
   };
 
-  const reset = () => setTurns([]);
+  const reset = () => {
+    setTurns([]);
+    setActiveTask(null);
+    navigate("/chat");
+  };
 
   return (
     <div className="max-w-4xl flex flex-col h-full">
@@ -56,14 +83,24 @@ export default function Chat() {
             用大白话描述你想要的数据,智能体会自动找模板或拼 OData 查询、生成 Excel。
           </p>
         </div>
-        {turns.length > 0 && (
-          <button
-            onClick={reset}
-            className="text-sm text-zinc-500 hover:text-red-600 px-3 py-1.5 border border-zinc-300 rounded-md"
-          >
-            清空对话
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          {activeTask && (
+            <Link
+              to={`/tasks/${activeTask}`}
+              className="text-sm text-zinc-500 hover:text-brand-600 px-3 py-1.5 border border-zinc-300 rounded-md"
+            >
+              📁 查看任务详情
+            </Link>
+          )}
+          {turns.length > 0 && (
+            <button
+              onClick={reset}
+              className="text-sm text-zinc-500 hover:text-red-600 px-3 py-1.5 border border-zinc-300 rounded-md"
+            >
+              新对话
+            </button>
+          )}
+        </div>
       </div>
 
       {!llmReady && (
@@ -199,4 +236,42 @@ export default function Chat() {
       </form>
     </div>
   );
+}
+
+
+function messagesToTurns(messages: TaskMessage[]): Turn[] {
+  const turns: Turn[] = [];
+  let pending: Turn | null = null;
+  for (const m of messages) {
+    if (m.role === "user") {
+      if (pending) turns.push(pending);
+      pending = { user: m.text || "" };
+    } else if (m.role === "assistant" && pending) {
+      // 把 assistant 消息当作 resp 装回去 (尽量保留信息,无 tokens 等)
+      const blocks = m.blocks || {};
+      pending.resp = {
+        task_id: m.task_id,
+        answer: m.text || "",
+        iterations: 0,
+        tool_calls: blocks.tool_calls || [],
+        input_tokens: 0,
+        output_tokens: 0,
+        llm_model: "",
+        task: blocks.task ? {
+          status: blocks.task.status as "done" | "failed",
+          row_count: blocks.task.row_count || 0,
+          rows_preview: [],
+          excel: blocks.task.excel_filename ? {
+            filename: blocks.task.excel_filename,
+            size_bytes: 0,
+            download_url: `/api/tasks/${m.task_id}/file`,
+          } : null,
+        } : null,
+      };
+      turns.push(pending);
+      pending = null;
+    }
+  }
+  if (pending) turns.push(pending);
+  return turns;
 }

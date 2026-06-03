@@ -37,6 +37,8 @@ export interface SkillSummary {
   description: string;
   keywords?: string[];
   params: SkillParam[];
+  status?: "draft" | "active" | "deprecated" | "archived";
+  favorite?: boolean;
 }
 
 export interface SkillDetail extends SkillSummary {
@@ -149,4 +151,50 @@ export interface SystemStatus {
   bw: string;
   llm: LlmStatus;
   skills_count: number;
+}
+
+export interface Favorite {
+  username: string;
+  kind: "skill" | "task";
+  ref_id: string;
+  created_at: string;
+}
+
+export interface TaskMessage {
+  id: string;
+  task_id: string;
+  role: "user" | "assistant" | "system";
+  text: string | null;
+  blocks: {
+    tool_calls?: ToolCallTrace[];
+    task?: {
+      status: string;
+      excel_filename?: string | null;
+      row_count?: number;
+    } | null;
+  } | null;
+  created_at: string;
+}
+
+export interface QuotaStatus {
+  month: string;
+  usage: { input_tokens: number; output_tokens: number; call_count: number };
+  limit_tokens: number | null;
+  remaining: number | null;
+}
+
+export interface AdminQuotaRow {
+  username: string;
+  input_tokens: number;
+  output_tokens: number;
+  call_count: number;
+  limit_tokens: number | null;
+}
+
+export interface SkillSourceResp {
+  id: string;
+  skill_md: string;
+  service_yaml: string;
+  has_template: boolean;
+  has_chart: boolean;
 }

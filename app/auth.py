@@ -1,27 +1,32 @@
-"""鉴权 (§8 - 一期简化版)。
+"""鉴权 (§8)。
 
-一期实现：
+实现:
   * 登录时用 BW Basic Auth 探测 catalog 服务,以验证凭据有效
-  * 凭据**不落盘**（一期简化,见 §8 说明）—— 仅在内存 session 中保留密码
+  * 凭据持久化: AES-256-GCM 加密后存 ``bw_creds`` 表 (§14, P2-15);
+    JWT payload 带 ``cred_id``,后端按 cred_id 解密拿密码
+  * 兼容旧路径: 若 DB 缺失或加密失败,降级到进程内存 cache
   * JWT cookie 用 HS256,签名密钥从 AUTH_SECRET env 取,启动时若空则随机生成
 
 二期升级:
-  * 凭据 AES-256-GCM 持久化
-  * SAML/OAuth SSO
+  * SAML/OAuth SSO + Principal Propagation
 
 mock 模式下,任意用户名密码都能通过(因为 mock 不验密码)。
 """
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import jwt as pyjwt
 
 from app.config import BWSettings
 from app.bw.live import LiveBWClient
+
+log = logging.getLogger(__name__)
 
 # 启动期生成 / 读取 JWT 密钥
 AUTH_SECRET = os.environ.get("AUTH_SECRET", "").strip() or secrets.token_urlsafe(48)
@@ -34,6 +39,7 @@ class Identity:
     username: str
     display_name: str
     role: str = "user"
+    cred_id: str | None = None
 
 
 class AuthError(Exception):
@@ -75,14 +81,45 @@ def verify_bw_credentials(bw_settings: BWSettings, username: str, password: str)
     return Identity(username=username, display_name=username, role="user")
 
 
-def save_credentials(username: str, password: str) -> None:
+def save_credentials(
+    username: str, password: str, *, db: Any | None = None,
+) -> str | None:
+    """优先 AES-256-GCM 加密落盘;失败或没传 db 时退回进程内存。
+
+    返回值: cred_id (写盘成功) 或 None (走内存 cache)。
+    """
+    if db is not None:
+        try:
+            from app.crypto import encrypt
+            ct, nonce = encrypt(password, aad=username.encode("utf-8"))
+            cred_id = db.save_bw_cred(
+                username=username, ciphertext=ct, nonce=nonce,
+                ttl_seconds=JWT_TTL_SECONDS,
+            )
+            return cred_id
+        except Exception as e:                                  # noqa: BLE001
+            log.warning("BW 凭据加密落盘失败,降级到内存 cache: %s", e)
     _credential_cache[username] = {
         "password": password,
         "expires_at": time.time() + JWT_TTL_SECONDS,
     }
+    return None
 
 
-def get_credentials(username: str) -> str | None:
+def get_credentials(
+    username: str, *, cred_id: str | None = None, db: Any | None = None,
+) -> str | None:
+    """优先按 cred_id 从加密表取;否则降级到进程内存 cache。"""
+    if cred_id and db is not None:
+        try:
+            from app.crypto import decrypt
+            rec = db.get_bw_cred(cred_id)
+            if rec and rec.get("username") == username:
+                pt = decrypt(rec["ciphertext"], rec["nonce"],
+                             aad=username.encode("utf-8"))
+                return pt.decode("utf-8")
+        except Exception as e:                                  # noqa: BLE001
+            log.warning("BW 凭据解密失败 cred_id=%s: %s", cred_id, e)
     rec = _credential_cache.get(username)
     if not rec:
         return None
@@ -92,7 +129,14 @@ def get_credentials(username: str) -> str | None:
     return str(rec["password"])
 
 
-def clear_credentials(username: str) -> None:
+def clear_credentials(
+    username: str, *, cred_id: str | None = None, db: Any | None = None,
+) -> None:
+    if cred_id and db is not None:
+        try:
+            db.delete_bw_cred(cred_id)
+        except Exception as e:                                  # noqa: BLE001
+            log.warning("删除加密凭据失败 cred_id=%s: %s", cred_id, e)
     _credential_cache.pop(username, None)
 
 
@@ -105,6 +149,8 @@ def issue_jwt(identity: Identity) -> str:
         "iat": now,
         "exp": now + JWT_TTL_SECONDS,
     }
+    if identity.cred_id:
+        payload["cred_id"] = identity.cred_id
     return pyjwt.encode(payload, AUTH_SECRET, algorithm=JWT_ALGO)
 
 
@@ -119,4 +165,5 @@ def decode_jwt(token: str) -> Identity:
         username=payload["sub"],
         display_name=payload.get("name", payload["sub"]),
         role=payload.get("role", "user"),
+        cred_id=payload.get("cred_id"),
     )
