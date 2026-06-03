@@ -1,0 +1,68 @@
+{
+  "entity_sets": [
+    {
+      "name": "PurchaseOrder",
+      "entity_type": "ZBW_PROC_SRV.PurchaseOrder",
+      "keys": [
+        "EBELN"
+      ],
+      "properties": [
+        {
+          "name": "EBELN",
+          "type": "Edm.String",
+          "label": "采购订单号"
+        },
+        {
+          "name": "LIFNR",
+          "type": "Edm.String",
+          "label": "供应商编号"
+        },
+        {
+          "name": "SupplierName",
+          "type": "Edm.String",
+          "label": "供应商名称"
+        },
+        {
+          "name": "WERKS",
+          "type": "Edm.String",
+          "label": "工厂代码"
+        },
+        {
+          "name": "MATNR",
+          "type": "Edm.String",
+          "label": "物料编号"
+        },
+        {
+          "name": "MaterialDesc",
+          "type": "Edm.String",
+          "label": "物料描述"
+        },
+        {
+          "name": "BEDAT",
+          "type": "Edm.String",
+          "label": "采购日期"
+        },
+        {
+          "name": "EINDT",
+          "type": "Edm.String",
+          "label": "交付日期"
+        },
+        {
+          "name": "MENGE",
+          "type": "Edm.Decimal",
+          "label": "数量"
+        },
+        {
+          "name": "NETWR_F",
+          "type": "Edm.Decimal",
+          "label": "金额(万元)"
+        },
+        {
+          "name": "DeliveryStatus",
+          "type": "Edm.String",
+          "label": "交付状态 (已交付/逾期/在途)"
+        }
+      ]
+    }
+  ]
+}

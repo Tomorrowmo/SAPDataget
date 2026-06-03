@@ -1,0 +1,18 @@
+service: ZBW_PROD_SRV
+entity_set: YieldByPlant
+
+filter_template: "CALMONTH eq '{{ month }}'"
+
+select:
+  - WERKS
+  - PlantName
+  - CALMONTH
+  - OUTPUT_QTY
+  - DEFECT_QTY
+  - YIELD_RATE
+  - OEE
+
+orderby: YIELD_RATE asc
+top: 50
+
+sheet_title: 工厂月度良率

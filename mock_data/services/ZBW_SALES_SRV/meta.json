@@ -1,0 +1,49 @@
+{
+  "entity_sets": [
+    {
+      "name": "SalesByOfficeView",
+      "entity_type": "ZBW_SALES_SRV.SalesByOffice",
+      "keys": ["OfficeCode", "CALMONTH"],
+      "properties": [
+        {"name": "OfficeCode",    "type": "Edm.String",  "label": "办事处编码"},
+        {"name": "OfficeName",    "type": "Edm.String",  "label": "办事处名称"},
+        {"name": "Region",        "type": "Edm.String",  "label": "大区代码 (HD/HN/HB/HX/XB/DB)"},
+        {"name": "RegionName",    "type": "Edm.String",  "label": "大区名称"},
+        {"name": "CALMONTH",      "type": "Edm.String",  "label": "年月 (YYYYMM)"},
+        {"name": "NETWR_F",       "type": "Edm.Decimal", "label": "净销售额(万元)"},
+        {"name": "GROSS_PROFIT",  "type": "Edm.Decimal", "label": "毛利(万元)"},
+        {"name": "GP_RATIO",      "type": "Edm.Decimal", "label": "毛利率(%)"},
+        {"name": "YoY",           "type": "Edm.Decimal", "label": "同比(%)"},
+        {"name": "MoM",           "type": "Edm.Decimal", "label": "环比(%)"}
+      ]
+    },
+    {
+      "name": "SalesByCustomer",
+      "entity_type": "ZBW_SALES_SRV.SalesByCustomer",
+      "keys": ["KUNNR", "CALMONTH"],
+      "properties": [
+        {"name": "KUNNR",        "type": "Edm.String",  "label": "客户编号"},
+        {"name": "CustomerName", "type": "Edm.String",  "label": "客户名称"},
+        {"name": "Industry",     "type": "Edm.String",  "label": "行业"},
+        {"name": "Region",       "type": "Edm.String",  "label": "大区"},
+        {"name": "CALMONTH",     "type": "Edm.String",  "label": "年月"},
+        {"name": "NETWR_F",      "type": "Edm.Decimal", "label": "净销售额(万元)"},
+        {"name": "OrderCount",   "type": "Edm.Int32",   "label": "订单数"}
+      ]
+    },
+    {
+      "name": "SalesOrderHeader",
+      "entity_type": "ZBW_SALES_SRV.SalesOrderHeader",
+      "keys": ["VBELN"],
+      "properties": [
+        {"name": "VBELN",       "type": "Edm.String",  "label": "订单号"},
+        {"name": "KUNNR",       "type": "Edm.String",  "label": "客户编号"},
+        {"name": "CustomerName","type": "Edm.String",  "label": "客户名称"},
+        {"name": "OfficeCode",  "type": "Edm.String",  "label": "办事处"},
+        {"name": "ERDAT",       "type": "Edm.String",  "label": "订单日期 (YYYY-MM-DD)"},
+        {"name": "NETWR_F",     "type": "Edm.Decimal", "label": "订单金额(万元)"},
+        {"name": "Status",      "type": "Edm.String",  "label": "订单状态 (新建/履约中/完成/取消)"}
+      ]
+    }
+  ]
+}

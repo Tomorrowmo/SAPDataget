@@ -1,0 +1,46 @@
+# ---------- Secrets ----------
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ---------- Python ----------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# ---------- Project runtime ----------
+# 用户数据库(含 base64 编码的 per-user API key,绝不能上传)
+data/app.sqlite3
+data/app.sqlite3-journal
+data/app.sqlite3-wal
+data/app.sqlite3-shm
+
+# Excel 导出结果与运行日志
+data/outputs/
+server.log
+server.log.err
+*.log
+
+# ---------- Frontend ----------
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+web/.vite/
+
+# ---------- Editor / OS ----------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

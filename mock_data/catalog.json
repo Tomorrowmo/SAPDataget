@@ -1,0 +1,39 @@
+{
+  "services": [
+    {
+      "TechnicalServiceName": "ZBW_SALES_SRV",
+      "Title": "销售分析服务",
+      "Description": "按办事处/客户/订单的销售额、毛利、同比环比",
+      "Version": "1",
+      "ServiceUrl": "/sap/opu/odata/sap/ZBW_SALES_SRV/"
+    },
+    {
+      "TechnicalServiceName": "ZBW_INV_SRV",
+      "Title": "库存分析服务",
+      "Description": "物料库存量、库存周转天数、出入库移动",
+      "Version": "1",
+      "ServiceUrl": "/sap/opu/odata/sap/ZBW_INV_SRV/"
+    },
+    {
+      "TechnicalServiceName": "ZBW_FIN_SRV",
+      "Title": "财务报表服务",
+      "Description": "总账余额、应收应付账龄、损益表",
+      "Version": "2",
+      "ServiceUrl": "/sap/opu/odata/sap/ZBW_FIN_SRV/"
+    },
+    {
+      "TechnicalServiceName": "ZBW_PROD_SRV",
+      "Title": "生产分析服务",
+      "Description": "生产订单状态、各工厂产量与良率",
+      "Version": "1",
+      "ServiceUrl": "/sap/opu/odata/sap/ZBW_PROD_SRV/"
+    },
+    {
+      "TechnicalServiceName": "ZBW_PROC_SRV",
+      "Title": "采购分析服务",
+      "Description": "采购订单及交付跟踪",
+      "Version": "1",
+      "ServiceUrl": "/sap/opu/odata/sap/ZBW_PROC_SRV/"
+    }
+  ]
+}

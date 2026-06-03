@@ -1,0 +1,21 @@
+service: ZBW_SALES_SRV
+entity_set: SalesByOfficeView
+
+filter_template: "Region eq '{{ region }}' and CALMONTH eq '{{ month }}'"
+
+select:
+  - OfficeCode
+  - OfficeName
+  - Region
+  - CALMONTH
+  - NETWR_F
+  - GROSS_PROFIT
+  - GP_RATIO
+  - YoY
+  - MoM
+
+orderby: NETWR_F desc
+
+top: "{{ top_n | default(10) }}"
+
+sheet_title: 月度销售大区简报
