@@ -1,0 +1,13 @@
+{
+  "entity_sets": [
+    {
+      "name": "LtResultSet",
+      "entity_type": "ZBW_QUERY_LIST_SRV.ReportList",
+      "keys": ["ReportID"],
+      "properties": [
+        {"name": "ReportID", "type": "Edm.String", "label": "报告 ID"},
+        {"name": "ReportDescription", "type": "Edm.String", "label": "报告描述"}
+      ]
+    }
+  ]
+}

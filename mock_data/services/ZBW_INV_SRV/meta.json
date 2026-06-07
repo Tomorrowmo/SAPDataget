@@ -1,0 +1,108 @@
+{
+  "entity_sets": [
+    {
+      "name": "StockByMaterial",
+      "entity_type": "ZBW_INV_SRV.StockByMaterial",
+      "keys": [
+        "MATNR",
+        "WERKS"
+      ],
+      "properties": [
+        {
+          "name": "MATNR",
+          "type": "Edm.String",
+          "label": "物料编号"
+        },
+        {
+          "name": "MaterialDesc",
+          "type": "Edm.String",
+          "label": "物料描述"
+        },
+        {
+          "name": "MTART",
+          "type": "Edm.String",
+          "label": "物料类型 (FERT成品/ROH原料)"
+        },
+        {
+          "name": "WERKS",
+          "type": "Edm.String",
+          "label": "工厂代码"
+        },
+        {
+          "name": "PlantName",
+          "type": "Edm.String",
+          "label": "工厂名称"
+        },
+        {
+          "name": "STOCK_QTY",
+          "type": "Edm.Decimal",
+          "label": "库存数量"
+        },
+        {
+          "name": "MEINS",
+          "type": "Edm.String",
+          "label": "单位"
+        },
+        {
+          "name": "STOCK_VALUE",
+          "type": "Edm.Decimal",
+          "label": "库存金额(万元)"
+        },
+        {
+          "name": "TURNOVER_DAY",
+          "type": "Edm.Decimal",
+          "label": "周转天数"
+        },
+        {
+          "name": "SafetyStock",
+          "type": "Edm.Decimal",
+          "label": "安全库存"
+        }
+      ]
+    },
+    {
+      "name": "StockMovement",
+      "entity_type": "ZBW_INV_SRV.StockMovement",
+      "keys": [
+        "MBLNR"
+      ],
+      "properties": [
+        {
+          "name": "MBLNR",
+          "type": "Edm.String",
+          "label": "物料凭证号"
+        },
+        {
+          "name": "BUDAT",
+          "type": "Edm.String",
+          "label": "过账日期 (YYYY-MM-DD)"
+        },
+        {
+          "name": "WERKS",
+          "type": "Edm.String",
+          "label": "工厂代码"
+        },
+        {
+          "name": "MATNR",
+          "type": "Edm.String",
+          "label": "物料编号"
+        },
+        {
+          "name": "MoveType",
+          "type": "Edm.String",
+          "label": "移动类型 (101入库/261发料/501收货)"
+        },
+        {
+          "name": "MENGE",
+          "type": "Edm.Decimal",
+          "label": "数量"
+        },
+        {
+          "name": "DMBTR",
+          "type": "Edm.Decimal",
+          "label": "金额(万元)"
+        }
+      ]
+    }
+  ]
+}

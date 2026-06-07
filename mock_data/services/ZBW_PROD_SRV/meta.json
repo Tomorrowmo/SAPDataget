@@ -1,0 +1,108 @@
+{
+  "entity_sets": [
+    {
+      "name": "ProductionOrder",
+      "entity_type": "ZBW_PROD_SRV.ProductionOrder",
+      "keys": [
+        "AUFNR"
+      ],
+      "properties": [
+        {
+          "name": "AUFNR",
+          "type": "Edm.String",
+          "label": "生产订单号"
+        },
+        {
+          "name": "WERKS",
+          "type": "Edm.String",
+          "label": "工厂代码"
+        },
+        {
+          "name": "PlantName",
+          "type": "Edm.String",
+          "label": "工厂名称"
+        },
+        {
+          "name": "MATNR",
+          "type": "Edm.String",
+          "label": "物料编号"
+        },
+        {
+          "name": "MaterialDesc",
+          "type": "Edm.String",
+          "label": "物料描述"
+        },
+        {
+          "name": "PSTRT",
+          "type": "Edm.String",
+          "label": "计划开始日期"
+        },
+        {
+          "name": "PEND",
+          "type": "Edm.String",
+          "label": "计划结束日期"
+        },
+        {
+          "name": "PLAN_QTY",
+          "type": "Edm.Decimal",
+          "label": "计划数量"
+        },
+        {
+          "name": "ACTUAL_QTY",
+          "type": "Edm.Decimal",
+          "label": "实际数量"
+        },
+        {
+          "name": "Status",
+          "type": "Edm.String",
+          "label": "状态 (REL已下达/CNF已确认/TECO技术完成)"
+        }
+      ]
+    },
+    {
+      "name": "YieldByPlant",
+      "entity_type": "ZBW_PROD_SRV.YieldByPlant",
+      "keys": [
+        "WERKS",
+        "CALMONTH"
+      ],
+      "properties": [
+        {
+          "name": "WERKS",
+          "type": "Edm.String",
+          "label": "工厂代码"
+        },
+        {
+          "name": "PlantName",
+          "type": "Edm.String",
+          "label": "工厂名称"
+        },
+        {
+          "name": "CALMONTH",
+          "type": "Edm.String",
+          "label": "年月"
+        },
+        {
+          "name": "OUTPUT_QTY",
+          "type": "Edm.Decimal",
+          "label": "产量"
+        },
+        {
+          "name": "DEFECT_QTY",
+          "type": "Edm.Decimal",
+          "label": "不良数量"
+        },
+        {
+          "name": "YIELD_RATE",
+          "type": "Edm.Decimal",
+          "label": "良率(%)"
+        },
+        {
+          "name": "OEE",
+          "type": "Edm.Decimal",
+          "label": "OEE(%)"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+service: ZBW_SALES_SRV
+entity_set: SalesByCustomer
+
+filter_template: >-
+  CALMONTH eq '{{ month }}'
+  {% if region %} and Region eq '{{ region }}'{% endif %}
+
+select:
+  - KUNNR
+  - CustomerName
+  - Industry
+  - Region
+  - CALMONTH
+  - NETWR_F
+  - OrderCount
+
+orderby: NETWR_F desc
+top: "{{ top_n | default(20) }}"
+sheet_title: 客户销售排名

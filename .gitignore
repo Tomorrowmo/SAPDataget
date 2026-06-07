@@ -1,0 +1,57 @@
+# ---------- Secrets ----------
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ---------- Python ----------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# ---------- Project runtime ----------
+# 用户数据库(含 base64 编码的 per-user API key,绝不能上传)
+data/app.sqlite3
+data/app.sqlite3-journal
+data/app.sqlite3-wal
+data/app.sqlite3-shm
+
+# Excel 导出结果与运行日志
+data/outputs/
+server.log
+server.log.err
+*.log
+full_odata_response.json
+full_odata_response_all_fields.csv
+full_odata_response_all_fields.xlsx
+full_odata_field_dictionary.csv
+full_odata_field_dictionary.xlsx
+
+# 测试用临时 skill 目录 (admin CRUD 测试自动生成,正常会自清,失败时残留)
+data/skills/test_temp_skill_*/
+data/skills/test_tpl_*/
+data/skills/test_chart_*/
+data/skills/test_visible_*/
+
+# ---------- Frontend ----------
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+web/.vite/
+
+# ---------- Editor / OS ----------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,143 @@
+{
+  "entity_sets": [
+    {
+      "name": "GLBalance",
+      "entity_type": "ZBW_FIN_SRV.GLBalance",
+      "keys": [
+        "HKONT",
+        "CALMONTH",
+        "BUKRS"
+      ],
+      "properties": [
+        {
+          "name": "BUKRS",
+          "type": "Edm.String",
+          "label": "公司代码"
+        },
+        {
+          "name": "HKONT",
+          "type": "Edm.String",
+          "label": "总账科目"
+        },
+        {
+          "name": "AccountName",
+          "type": "Edm.String",
+          "label": "科目名称"
+        },
+        {
+          "name": "AccountType",
+          "type": "Edm.String",
+          "label": "科目类型 (资产/负债/损益)"
+        },
+        {
+          "name": "CALMONTH",
+          "type": "Edm.String",
+          "label": "年月"
+        },
+        {
+          "name": "DEBIT_F",
+          "type": "Edm.Decimal",
+          "label": "借方发生额(万元)"
+        },
+        {
+          "name": "CREDIT_F",
+          "type": "Edm.Decimal",
+          "label": "贷方发生额(万元)"
+        },
+        {
+          "name": "BALANCE_F",
+          "type": "Edm.Decimal",
+          "label": "期末余额(万元)"
+        }
+      ]
+    },
+    {
+      "name": "ARAging",
+      "entity_type": "ZBW_FIN_SRV.ARAging",
+      "keys": [
+        "KUNNR"
+      ],
+      "properties": [
+        {
+          "name": "KUNNR",
+          "type": "Edm.String",
+          "label": "客户编号"
+        },
+        {
+          "name": "CustomerName",
+          "type": "Edm.String",
+          "label": "客户名称"
+        },
+        {
+          "name": "TOTAL_F",
+          "type": "Edm.Decimal",
+          "label": "应收总额(万元)"
+        },
+        {
+          "name": "Bucket_0_30",
+          "type": "Edm.Decimal",
+          "label": "0-30天(万元)"
+        },
+        {
+          "name": "Bucket_31_60",
+          "type": "Edm.Decimal",
+          "label": "31-60天(万元)"
+        },
+        {
+          "name": "Bucket_61_90",
+          "type": "Edm.Decimal",
+          "label": "61-90天(万元)"
+        },
+        {
+          "name": "Bucket_90Plus",
+          "type": "Edm.Decimal",
+          "label": "90天以上(万元)"
+        }
+      ]
+    },
+    {
+      "name": "APAging",
+      "entity_type": "ZBW_FIN_SRV.APAging",
+      "keys": [
+        "LIFNR"
+      ],
+      "properties": [
+        {
+          "name": "LIFNR",
+          "type": "Edm.String",
+          "label": "供应商编号"
+        },
+        {
+          "name": "SupplierName",
+          "type": "Edm.String",
+          "label": "供应商名称"
+        },
+        {
+          "name": "TOTAL_F",
+          "type": "Edm.Decimal",
+          "label": "应付总额(万元)"
+        },
+        {
+          "name": "Bucket_0_30",
+          "type": "Edm.Decimal",
+          "label": "0-30天(万元)"
+        },
+        {
+          "name": "Bucket_31_60",
+          "type": "Edm.Decimal",
+          "label": "31-60天(万元)"
+        },
+        {
+          "name": "Bucket_61_90",
+          "type": "Edm.Decimal",
+          "label": "61-90天(万元)"
+        },
+        {
+          "name": "Bucket_90Plus",
+          "type": "Edm.Decimal",
+          "label": "90天以上(万元)"
+        }
+      ]
+    }
+  ]
+}

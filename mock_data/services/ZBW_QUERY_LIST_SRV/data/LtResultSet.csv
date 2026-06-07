@@ -1,0 +1,6 @@
+ReportID,ReportDescription
+ZRPT_SALES_OVERVIEW,销售总览报表
+ZRPT_MARGIN_ANALYSIS,毛利分析报表
+ZRPT_CUSTOMER_TOP,客户销售排行报表
+ZRPT_FACTORY_YIELD,工厂良率报表
+ZRPT_PROC_DELIVERY,采购交付跟踪报表
