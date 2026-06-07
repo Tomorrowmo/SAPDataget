@@ -1385,7 +1385,8 @@ def my_quota_endpoint(identity: Identity = Depends(current_identity)) -> dict[st
 
 _web_dist = Path(__file__).resolve().parent.parent / "web" / "dist"
 _web_root = Path(__file__).resolve().parent.parent / "web"
-_web_index = _web_dist / "index.html" if _web_dist.exists() else _web_root / "index.html"
+_web_dist_index = _web_dist / "index.html"
+_web_index = _web_dist_index if _web_dist_index.exists() else _web_root / "index.html"
 
 if (_web_dist / "assets").exists():
     # Vite 构建产物
