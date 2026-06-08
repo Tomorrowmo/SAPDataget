@@ -191,14 +191,7 @@ export default function Chat() {
                 📁 查看任务详情
               </Link>
             )}
-            {turns.length > 0 && (
-              <button
-                onClick={reset}
-                className="text-sm text-zinc-500 hover:text-red-600 px-3 py-1.5 border border-zinc-300 rounded-md"
-              >
-                新对话
-              </button>
-            )}
+            {/* "新对话"已移到左侧会话侧栏顶部,头部不再重复 */}
           </div>
         </div>
 
