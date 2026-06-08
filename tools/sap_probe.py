@@ -71,6 +71,23 @@ def code(obj, limit: int = 3000) -> None:
     w("```")
 
 
+def _read_password(provided: str) -> str:
+    """取密码:--password / 环境变量 BW_PASSWORD / 交互输入。
+    getpass 在部分终端(Git Bash、某些 IDE 终端)不可用或卡住 → 自动退回可见的 input()。"""
+    if provided:
+        return provided
+    env = os.environ.get("BW_PASSWORD")
+    if env:
+        return env
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return getpass.getpass("SAP 密码(输入时不显示,直接打完按回车): ")
+    except Exception:                                              # noqa: BLE001
+        pass
+    print("(当前终端无法隐藏输入,密码将明文可见;或改用 --password / .env 的 BW_PASSWORD)")
+    return input("SAP 密码: ")
+
+
 def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
@@ -104,7 +121,7 @@ def main() -> None:
     user = args.user.strip()
     if not user:
         user = input("SAP 用户名: ").strip()
-    password = args.password or os.environ.get("BW_PASSWORD") or getpass.getpass("SAP 密码: ")
+    password = _read_password(args.password)
     base_url = (args.base_url or "").rstrip("/")
     if not base_url:
         print("缺 base_url(请在 .env 配 BW_BASE_URL 或用 --base-url)"); sys.exit(1)
