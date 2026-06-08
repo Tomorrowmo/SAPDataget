@@ -17,7 +17,7 @@ export default function Layout({ children }: { children: ReactNode }) {
     { to: "/", label: "📊 模板画廊", end: true },
     { to: "/chat", label: "💬 自由对话" },
     { to: "/tasks", label: "📁 我的任务" },
-    { to: "/llm-keys", label: "🔑 我的 API Keys" },
+    { to: "/llm-keys", label: "🔑 LLM 设置" },
   ];
   const adminItems = [
     { to: "/admin/skills", label: "🛠 Skill 管理" },

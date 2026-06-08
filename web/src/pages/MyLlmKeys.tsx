@@ -1,308 +1,296 @@
-// 我的 LLM API Keys —— 每用户独立配置
+// 🔑 LLM 设置 —— 完全参照 DataAgent SettingsView：
+// provider 预设(DeepSeek/Qwen/OpenAI/Custom)一键填好 Base URL + Model,
+// 用户通常只需粘贴 API key。Model 可下拉选,也可自定义;Base URL 有默认值。
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { useAuth } from "../auth";
+import type { LlmSettings, LlmTestResult } from "../types";
 
-interface ProviderKeyMeta {
-  env_var: string;
-  provider: string;
-  models: string[];
-  configured: boolean;
-  source: "user" | "env" | null;
-  tail: string | null;
-  updated_at: string | null;
-  has_personal: boolean;
-  has_env_fallback: boolean;
+type PresetId = "deepseek" | "qwen" | "openai" | "custom";
+
+interface Preset {
+  id: PresetId;
+  label: string;
+  base_url: string;
+  default_model: string;
+  model_options: string[];
+  key_hint: string;
+  docs: string;
 }
 
-interface TestResult {
-  ok: boolean;
-  model?: string;
-  key_source?: string;
-  latency_ms?: number;
-  reply?: string;
-  error?: string;
-  category?: string;
+const PRESETS: Preset[] = [
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    base_url: "https://api.deepseek.com/v1",
+    default_model: "deepseek-chat",
+    model_options: ["deepseek-chat", "deepseek-reasoner"],
+    key_hint: "sk-...",
+    docs: "https://platform.deepseek.com/api_keys",
+  },
+  {
+    id: "qwen",
+    label: "通义千问 (DashScope)",
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    default_model: "qwen-plus",
+    model_options: ["qwen-plus", "qwen-max", "qwen-turbo", "qwen3-coder-plus"],
+    key_hint: "sk-...",
+    docs: "https://dashscope.console.aliyun.com/apiKey",
+  },
+  {
+    id: "openai",
+    label: "OpenAI",
+    base_url: "https://api.openai.com/v1",
+    default_model: "gpt-4o-mini",
+    model_options: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
+    key_hint: "sk-...",
+    docs: "https://platform.openai.com/api-keys",
+  },
+  {
+    id: "custom",
+    label: "自定义 (任意 OpenAI 兼容端点)",
+    base_url: "",
+    default_model: "",
+    model_options: [],
+    key_hint: "Bearer token",
+    docs: "",
+  },
+];
+
+function presetFor(base_url: string): PresetId {
+  if (!base_url) return "deepseek";
+  const hit = PRESETS.find((p) => p.id !== "custom" && p.base_url === base_url);
+  return hit?.id ?? "custom";
 }
 
 export default function MyLlmKeys() {
   const { identity, refreshStatus } = useAuth();
-  const [rows, setRows] = useState<ProviderKeyMeta[]>([]);
-  const [editing, setEditing] = useState<string | null>(null);
-  const [keyInput, setKeyInput] = useState("");
+  const [s, setS] = useState<LlmSettings | null>(null);
+  const [presetId, setPresetId] = useState<PresetId>("deepseek");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [model, setModel] = useState("");
+  const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
-  const [testing, setTesting] = useState<string | null>(null);
-  const [testResults, setTestResults] = useState<Record<string, TestResult>>({});
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+  const [test, setTest] = useState<LlmTestResult | null>(null);
+  const [testing, setTesting] = useState(false);
 
-  const load = async () => {
-    const { providers } = await api.listLlmKeys();
-    setRows(providers);
-  };
+  const preset = PRESETS.find((p) => p.id === presetId)!;
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    api.getLlmSettings().then((data) => {
+      setS(data);
+      const detected = presetFor(data.base_url || "");
+      setPresetId(detected);
+      if (data.base_url || data.model) {
+        // 用户已存过 → 用其值
+        setBaseUrl(data.base_url);
+        setModel(data.model);
+      } else {
+        // 全新用户 → 预填 DeepSeek 预设(用户只需粘贴 key)
+        const p = PRESETS.find((x) => x.id === detected)!;
+        setBaseUrl(p.base_url);
+        setModel(p.default_model);
+      }
+    }).catch(() => {});
+  }, []);
 
-  const save = async (envVar: string) => {
-    if (!keyInput.trim()) return;
-    setBusy(true);
-    setMsg(null);
+  function pickPreset(id: PresetId) {
+    setPresetId(id);
+    setSaved(false);
+    setError("");
+    const p = PRESETS.find((x) => x.id === id)!;
+    if (id !== "custom") {
+      setBaseUrl(p.base_url);
+      if (!model || !p.model_options.includes(model)) setModel(p.default_model);
+    } else {
+      setBaseUrl("");
+      setModel("");
+    }
+  }
+
+  async function save(clearKey = false) {
+    setBusy(true); setError(""); setSaved(false); setTest(null);
     try {
-      const r = await api.setLlmKey(envVar, keyInput.trim());
-      setMsg(`✅ ${envVar} 已保存(末 4 位 …${r.tail})。建议点「🧪 测试」立即验证。`);
-      setEditing(null);
-      setKeyInput("");
-      await load();
+      const data = await api.saveLlmSettings({
+        api_key: clearKey ? "" : (key.trim() ? key.trim() : null),
+        base_url: baseUrl.trim(),
+        model: model.trim(),
+      });
+      setS(data);
+      setKey("");
+      setSaved(true);
       await refreshStatus();
     } catch (e) {
-      setMsg(`❌ ${e instanceof Error ? e.message : e}`);
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
-  };
+  }
 
-  const remove = async (envVar: string) => {
-    if (!confirm(`确认清除你自己的 ${envVar}?\n(系统级 .env fallback 不受影响)`)) return;
-    await api.deleteLlmKey(envVar);
-    setTestResults((t) => { const { [envVar]: _, ...rest } = t; return rest; });
-    await load();
-    await refreshStatus();
-  };
-
-  const test = async (envVar: string) => {
-    setTesting(envVar);
+  async function runTest() {
+    setTesting(true); setTest(null);
     try {
-      const r = await api.testLlmKey(envVar);
-      setTestResults((t) => ({ ...t, [envVar]: r }));
+      setTest(await api.testLlmSettings());
     } catch (e) {
-      setTestResults((t) => ({
-        ...t,
-        [envVar]: { ok: false, error: e instanceof Error ? e.message : String(e) },
-      }));
+      setTest({ ok: false, error: e instanceof Error ? e.message : String(e), category: "other" });
     } finally {
-      setTesting(null);
+      setTesting(false);
     }
-  };
+  }
+
+  if (!s) return <div className="text-sm text-zinc-500 p-6">加载中…</div>;
 
   return (
-    <div className="max-w-5xl">
-      <h1 className="text-2xl font-semibold text-zinc-900">🔑 我的 API Keys</h1>
+    <div className="max-w-2xl">
+      <h1 className="text-2xl font-semibold text-zinc-900">🔑 LLM 设置</h1>
       <p className="text-sm text-zinc-500 mt-1">
-        每个用户的 key 各自隔离 —— 你在这里配的 key 只对 <strong>{identity?.username}</strong> 生效,
-        其他用户用他们自己的。系统 <code>.env</code> 中的全局 key 作为兜底 fallback。
+        选一个服务商,通常只需粘贴你的 API Key 即可（Base URL 与 Model 已自动填好,可改)。
+        配置只对 <strong>{identity?.username}</strong> 生效,留空回退系统 <code>.env</code> 默认。
       </p>
 
-      <div className="mt-4 bg-amber-50 border border-amber-200 rounded-md px-4 py-3 text-sm text-amber-800">
-        <strong>安全说明：</strong> key 经 base64 编码存到 SQLite (<code>app.sqlite3</code>),
-        DB 文件由 OS FS 权限保护,API 永不返回真值（只回末 4 位）。二期升级为 AES-256-GCM。
+      {/* 当前生效状态 */}
+      <div className={`mt-4 px-4 py-2.5 rounded-lg border text-sm ${
+        s.effective_ready ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+                          : "bg-amber-50 border-amber-200 text-amber-800"
+      }`}>
+        {s.effective_ready ? "● 已就绪" : "○ 未就绪"} · 当前生效模型{" "}
+        <code className="font-mono">{s.effective_model || "(未设置)"}</code> · key 来源{" "}
+        {s.key_source === "user" ? "👤 你自己" : s.key_source === "env" ? "🌐 系统 .env" : "无"}
       </div>
 
-      {msg && (
-        <div className="mt-4 px-3 py-2 bg-zinc-100 border border-zinc-200 rounded text-sm">
-          {msg}
+      <div className="mt-5 bg-white border border-zinc-200 rounded-xl p-5">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-brand-600">🔑</span>
+          <h3 className="font-medium text-zinc-800">大语言模型接入</h3>
         </div>
-      )}
+        <p className="text-sm text-zinc-500 mb-4">
+          当前你的 key:<strong>{s.has_key ? " 已设置" : (s.env_has_key ? " 未设置(用 .env 兜底)" : " 未设置")}</strong>
+        </p>
 
-      <div className="mt-6 bg-white border border-zinc-200 rounded-lg overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="bg-zinc-100 text-zinc-700">
-            <tr>
-              <th className="px-3 py-2 text-left font-medium">env_var</th>
-              <th className="px-3 py-2 text-left font-medium">Provider</th>
-              <th className="px-3 py-2 text-left font-medium">关联模型</th>
-              <th className="px-3 py-2 text-left font-medium">状态</th>
-              <th className="px-3 py-2 text-left font-medium">来源</th>
-              <th className="px-3 py-2 text-left font-medium">末 4 位</th>
-              <th className="px-3 py-2 text-left font-medium">更新时间</th>
-              <th className="px-3 py-2 text-center font-medium">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((p) => (
+        {/* provider 预设 */}
+        <label className="block text-xs font-medium text-zinc-700 mb-1">服务商</label>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
+          {PRESETS.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() => pickPreset(p.id)}
+              className={`text-left text-xs px-3 py-2 rounded-lg border transition ${
+                presetId === p.id
+                  ? "border-brand-500 bg-brand-50 text-brand-700 font-medium"
+                  : "border-zinc-200 hover:bg-zinc-50 text-zinc-700"
+              }`}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Base URL(有默认) */}
+        <label className="block text-xs font-medium text-zinc-700 mb-1">Base URL</label>
+        <input
+          type="text"
+          value={baseUrl}
+          onChange={(e) => { setBaseUrl(e.target.value); setSaved(false); }}
+          placeholder={preset.id === "custom" ? "https://your-endpoint/v1" : preset.base_url}
+          className="w-full border border-zinc-300 rounded-lg px-3 py-2 text-sm font-mono mb-3 focus:outline-none focus:ring-2 focus:ring-brand-500"
+        />
+
+        {/* Model(可选 也可自定义) */}
+        <label className="block text-xs font-medium text-zinc-700 mb-1">Model</label>
+        {preset.model_options.length > 0 ? (
+          <div className="flex gap-2 items-center mb-3">
+            <select
+              value={preset.model_options.includes(model) ? model : "__custom"}
+              onChange={(e) => { if (e.target.value !== "__custom") setModel(e.target.value); setSaved(false); }}
+              className="border border-zinc-300 rounded-lg px-2 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-brand-500"
+            >
+              {preset.model_options.map((m) => <option key={m} value={m}>{m}</option>)}
+              <option value="__custom">自定义…</option>
+            </select>
+            <input
+              type="text"
+              value={model}
+              onChange={(e) => { setModel(e.target.value); setSaved(false); }}
+              placeholder="model id"
+              className="flex-1 border border-zinc-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500"
+            />
+          </div>
+        ) : (
+          <input
+            type="text"
+            value={model}
+            onChange={(e) => { setModel(e.target.value); setSaved(false); }}
+            placeholder="e.g. qwen2.5:72b（本地 Ollama）"
+            className="w-full border border-zinc-300 rounded-lg px-3 py-2 text-sm font-mono mb-3 focus:outline-none focus:ring-2 focus:ring-brand-500"
+          />
+        )}
+
+        {/* API Key(主输入) */}
+        <label className="block text-xs font-medium text-zinc-700 mb-1">API Key</label>
+        <input
+          type="password"
+          value={key}
+          onChange={(e) => { setKey(e.target.value); setSaved(false); }}
+          placeholder={s.has_key ? "（已设置，留空=保持不变）" : preset.key_hint}
+          className="w-full border border-zinc-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500"
+        />
+        <div className="text-xs text-zinc-500 mt-2">
+          {preset.docs && (
+            <>申请 key:<a className="text-brand-600 hover:underline" href={preset.docs} target="_blank" rel="noreferrer">{preset.docs}</a>。</>
+          )}
+          {" "}key 经 base64 暂存于本地 SQLite，API 永不回读真值。
+          {s.has_key && (
+            <button onClick={() => save(true)} disabled={busy} className="ml-2 text-red-600 hover:underline">清除我的 key</button>
+          )}
+        </div>
+
+        <div className="flex gap-2 mt-4">
+          <button
+            onClick={() => save(false)}
+            disabled={busy}
+            className={`px-5 py-2 rounded-lg font-medium text-white disabled:opacity-50 ${
+              saved ? "bg-emerald-600" : "bg-brand-600 hover:bg-brand-700"
+            }`}
+          >
+            {busy ? "保存中…" : saved ? "✓ 已保存" : "保存"}
+          </button>
+          <button
+            onClick={runTest}
+            disabled={testing || !s.effective_ready}
+            title={s.effective_ready ? "用当前生效配置发一次真实请求" : "先保存好配置再测试"}
+            className="px-5 py-2 border border-emerald-300 text-emerald-700 hover:bg-emerald-50 rounded-lg font-medium disabled:opacity-50"
+          >
+            {testing ? "测试中…" : "🧪 测试"}
+          </button>
+        </div>
+
+        {error && <div className="mt-3 text-sm text-red-600">⚠ {error}</div>}
+
+        {test && (
+          <div className={`mt-3 px-3 py-2 rounded text-sm ${test.ok ? "bg-emerald-50 text-emerald-800" : "bg-red-50 text-red-800"}`}>
+            {test.ok ? (
+              <>✅ key 有效 · 模型 <code className="font-mono">{test.model}</code> · 耗时 {test.latency_ms}ms · 回复 <span className="font-mono">{test.reply || "(空)"}</span></>
+            ) : (
               <>
-                <tr key={p.env_var} className="border-t border-zinc-100 hover:bg-zinc-50">
-                  <td className="px-3 py-2 font-mono">{p.env_var}</td>
-                  <td className="px-3 py-2">{p.provider}</td>
-                  <td className="px-3 py-2 text-xs text-zinc-500">
-                    {p.models.map((m) => (
-                      <div key={m} className="font-mono">{m}</div>
-                    ))}
-                  </td>
-                  <td className="px-3 py-2">
-                    {p.configured ? (
-                      <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 text-xs">
-                        ●已配置
-                      </span>
-                    ) : (
-                      <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-700 text-xs">
-                        未配置
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-3 py-2 text-xs">
-                    {p.source === "user" ? (
-                      <span className="text-brand-600">👤 你自己</span>
-                    ) : p.source === "env" ? (
-                      <span className="text-zinc-500" title="来自 .env 文件,所有用户共用">
-                        🌐 系统 fallback
-                      </span>
-                    ) : "—"}
-                  </td>
-                  <td className="px-3 py-2 font-mono text-xs text-zinc-500">
-                    {p.tail ? `…${p.tail}` : "—"}
-                  </td>
-                  <td className="px-3 py-2 text-xs text-zinc-500">
-                    {p.updated_at || "—"}
-                  </td>
-                  <td className="px-3 py-2 text-center">
-                    <div className="flex justify-center gap-3">
-                      <button
-                        onClick={() => { setEditing(p.env_var); setKeyInput(""); }}
-                        className="text-brand-600 hover:underline text-xs"
-                      >
-                        {p.has_personal ? "修改我的" : "配置我的"}
-                      </button>
-                      {p.configured && (
-                        <button
-                          onClick={() => test(p.env_var)}
-                          disabled={testing === p.env_var}
-                          className="text-emerald-600 hover:underline text-xs disabled:opacity-50"
-                          title="发一次真实请求验证 key 有效"
-                        >
-                          {testing === p.env_var ? "测试中…" : "🧪 测试"}
-                        </button>
-                      )}
-                      {p.has_personal && (
-                        <button
-                          onClick={() => remove(p.env_var)}
-                          className="text-red-600 hover:underline text-xs"
-                        >
-                          清除
-                        </button>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-                {editing === p.env_var && (
-                  <tr className="bg-brand-50">
-                    <td colSpan={8} className="px-3 py-3">
-                      <div className="flex gap-2 items-center">
-                        <span className="text-xs text-zinc-600 font-mono whitespace-nowrap">
-                          {p.env_var}=
-                        </span>
-                        <input
-                          type="password"
-                          value={keyInput}
-                          onChange={(e) => setKeyInput(e.target.value)}
-                          placeholder={`粘贴你的 ${p.provider} API key`}
-                          autoFocus
-                          className="flex-1 px-3 py-1.5 border border-zinc-300 rounded text-sm font-mono"
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") save(p.env_var);
-                            if (e.key === "Escape") { setEditing(null); setKeyInput(""); }
-                          }}
-                        />
-                        <button
-                          onClick={() => save(p.env_var)}
-                          disabled={busy || !keyInput.trim()}
-                          className="px-4 py-1.5 bg-brand-600 hover:bg-brand-700 text-white text-sm rounded disabled:opacity-50"
-                        >
-                          {busy ? "..." : "保存"}
-                        </button>
-                        <button
-                          onClick={() => { setEditing(null); setKeyInput(""); }}
-                          className="px-4 py-1.5 border border-zinc-300 text-sm rounded"
-                        >
-                          取消
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
+                <div className="font-medium">❌ 测试失败（{test.category}）</div>
+                <div className="text-xs mt-1 font-mono whitespace-pre-wrap">{test.error}</div>
+                {test.category === "auth" && (
+                  <div className="text-xs mt-2 bg-white p-2 rounded border border-red-200">
+                    💡 key 被服务商拒绝（不是系统 bug）：确认从官方控制台复制、无多余空格、账户没欠费。
+                  </div>
                 )}
-                {testResults[p.env_var] && (
-                  <tr className={testResults[p.env_var].ok ? "bg-emerald-50" : "bg-red-50"}>
-                    <td colSpan={8} className="px-3 py-2 text-sm">
-                      {testResults[p.env_var].ok ? (
-                        <div className="text-emerald-800">
-                          ✅ key 有效 ·
-                          模型 <code className="font-mono">{testResults[p.env_var].model}</code> ·
-                          耗时 {testResults[p.env_var].latency_ms}ms ·
-                          回复 <span className="font-mono">{testResults[p.env_var].reply || "(空)"}</span>
-                        </div>
-                      ) : (
-                        <div className="text-red-800">
-                          <div className="font-medium">
-                            ❌ 测试失败 ({testResults[p.env_var].category})
-                          </div>
-                          <div className="text-xs mt-1 font-mono whitespace-pre-wrap">
-                            {testResults[p.env_var].error}
-                          </div>
-                          {testResults[p.env_var].category === "auth" && (
-                            <div className="text-xs mt-2 text-red-700 bg-white p-2 rounded border border-red-200">
-                              💡 <strong>key 被 provider 拒绝</strong> —— 这不是系统 bug,而是 key 本身无效。请：
-                              <ul className="list-disc pl-5 mt-1">
-                                <li>确认你从对应的官方控制台复制的 key（千问需要从 dashscope.console.aliyun.com 申请）</li>
-                                <li>检查没有多余空格、换行</li>
-                                <li>确认账户没欠费 / 没被禁用</li>
-                              </ul>
-                            </div>
-                          )}
-                          {testResults[p.env_var].category === "network" && (
-                            <div className="text-xs mt-2 text-red-700 bg-white p-2 rounded border border-red-200">
-                              💡 <strong>网络不通</strong>。如果公司有防火墙：
-                              <ul className="list-disc pl-5 mt-1">
-                                <li>千问 / DeepSeek 在国内,通常公司网就能直连</li>
-                                <li>Claude / GPT 需要公网,可能要走代理</li>
-                              </ul>
-                            </div>
-                          )}
-                          {testResults[p.env_var].category === "not_configured" && (
-                            <div className="text-xs mt-1 text-red-600">
-                              💡 先点上方的「配置我的」保存 key。
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </td>
-                  </tr>
+                {test.category === "network" && (
+                  <div className="text-xs mt-2 bg-white p-2 rounded border border-red-200">
+                    💡 网络不通：千问 / DeepSeek 国内多可直连；OpenAI 需公网（可能要走代理）。
+                  </div>
                 )}
               </>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      <div className="mt-6 text-sm text-zinc-500">
-        <strong>各 provider 申请 key 的入口：</strong>
-        <ul className="mt-2 space-y-1 list-disc pl-5">
-          <li>
-            <strong>通义千问 (Dashscope)</strong> ➜
-            <a href="https://dashscope.console.aliyun.com/apiKey" target="_blank" rel="noreferrer" className="text-brand-600 hover:underline ml-1">
-              dashscope.console.aliyun.com/apiKey
-            </a>
-            <span className="text-zinc-400 ml-2">— 阿里云账号登录后申请,免费有额度</span>
-          </li>
-          <li>
-            <strong>DeepSeek</strong> ➜
-            <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer" className="text-brand-600 hover:underline ml-1">
-              platform.deepseek.com/api_keys
-            </a>
-            <span className="text-zinc-400 ml-2">— 国内直连最便宜</span>
-          </li>
-          <li>
-            <strong>Claude</strong> ➜
-            <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer" className="text-brand-600 hover:underline ml-1">
-              console.anthropic.com
-            </a>
-            <span className="text-zinc-400 ml-2">— 需公网</span>
-          </li>
-          <li>
-            <strong>OpenAI</strong> ➜
-            <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer" className="text-brand-600 hover:underline ml-1">
-              platform.openai.com
-            </a>
-            <span className="text-zinc-400 ml-2">— 需公网</span>
-          </li>
-        </ul>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

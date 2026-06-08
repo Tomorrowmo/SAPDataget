@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.agent import Agent
+from app.agent_stream import StreamAgent
 from app.task_bus import BUS as TASK_BUS
 from app.auth import (
     AuthError, Identity, clear_credentials, decode_jwt, get_credentials,
@@ -778,6 +780,13 @@ class ApiKeyRequest(BaseModel):
     value: str               # 明文 key,后端 base64 暂存
 
 
+class LlmSettingsRequest(BaseModel):
+    """DataAgent 式三元组。api_key: None=保持原值, ""=清空, 非空=更新。"""
+    api_key: str | None = None
+    base_url: str = ""
+    model: str = ""
+
+
 # ============================== /api/status ==============================
 
 @app.get("/api/status")
@@ -850,202 +859,151 @@ def auth_me(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
 
 # ============================== /api/llm ==============================
 
-@app.get("/api/llm/models")
-def list_llm_models(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
-    """带「当前用户能否调用」的视图。
+# ---------- 每用户 LLM 配置 (DataAgent 式 BYOK: key + base_url + model 三元组) ----------
 
-    每个模型的 ready 字段 = 当前用户已配 key OR .env 有 fallback。
+def _resolve_user_llm(identity: Identity | None) -> dict[str, Any]:
+    """解析当前用户的有效 LLM 配置:用户三元组优先,留空字段回退 .env 默认。
+
+    .env 默认来自 Settings.llm(LLM_MODEL / LLM_API_KEY / LLM_API_BASE)。
+    ready = 有 model 且 (有 key 或 有 base_url —— 本地 ollama 等无 key 端点也算就绪)。
     """
-    base = _user_llm_status(identity)
-    # 顺手标注 key 来源 (user / env / None),供 UI 区分私有 vs 全局兜底
-    for m in base["models"]:
-        env_var = next((x.api_key_env for x in KNOWN_MODELS if x.id == m["id"]), "")
-        if env_var:
-            _val, src = _effective_key(identity.username, env_var)
-            m["key_source"] = src
-    return base
+    env_model = STATE.settings.llm.model or ""
+    env_key = STATE.settings.llm.api_key or ""
+    env_base = STATE.settings.llm.api_base or ""
+
+    user = STATE.db.get_user_llm_settings(identity.username) if identity else None
+    u_key = (user or {}).get("api_key") or ""
+    u_base = (user or {}).get("base_url") or ""
+    u_model = (user or {}).get("model") or ""
+
+    model = u_model or env_model
+    base_url = u_base or env_base
+    if u_key:
+        api_key, key_source = u_key, "user"
+    elif env_key:
+        api_key, key_source = env_key, "env"
+    else:
+        api_key, key_source = "", None
+
+    return {
+        "model": model,
+        "api_key": api_key,
+        "base_url": base_url,
+        "key_source": key_source,
+        "ready": bool(model) and (bool(api_key) or bool(base_url)),
+        "has_user_key": bool(u_key),
+        "user_model": u_model,
+        "user_base_url": u_base,
+        "env_has_key": bool(env_key),
+        "env_model": env_model,
+        "env_base_url": env_base,
+        "updated_at": (user or {}).get("updated_at"),
+    }
 
 
-# ---------- LLM API keys (每用户独立) ----------
-
-def _effective_key(username: str, env_var: str) -> tuple[str | None, str | None]:
-    """取用户的有效 key —— 优先用户私有 (DB),无则用 .env 全局 fallback。
-
-    Returns (key_value_or_none, source: "user"|"env"|None)
-    """
-    own = STATE.db.get_user_api_key(username, env_var)
-    if own:
-        return own, "user"
-    fb = os.environ.get(env_var, "").strip()
-    if fb:
-        return fb, "env"
-    return None, None
+def _build_user_llm(identity: Identity | None) -> LLMClient:
+    """据 _resolve_user_llm 造一个 per-request LLMClient。"""
+    r = _resolve_user_llm(identity)
+    c = LLMClient(STATE.settings.llm)
+    c.model = r["model"]
+    c.api_key = r["api_key"] or None
+    c.api_base = r["base_url"] or None
+    return c
 
 
 def _user_llm_status(identity: Identity | None) -> dict[str, Any]:
-    """构造「按当前用户视角」的 LLM 状态。
-
-    `/api/status` (匿名可访问) 和 `/api/llm/models` (需登录) 都走这里,
-    保证两个端点对 current_ready / models[].ready 的口径完全一致。
-    未登录时退化为 .env 全局 fallback 判断。
-    """
-    if identity is None:
-        return STATE.llm.current_status()
-
-    def is_ready(info):
-        if not info.api_key_env:
-            return True
-        key, _src = _effective_key(identity.username, info.api_key_env)
-        return bool(key)
-
-    return STATE.llm.current_status(is_ready=is_ready)
+    """`/api/status` 用的 LLM 状态块(沿用旧字段名,前端无需改 current/current_ready)。
+    models 已弃用(取消模型注册表/选择器),固定空列表。"""
+    r = _resolve_user_llm(identity)
+    return {
+        "current": r["model"],
+        "current_display": r["model"] or "(未配置)",
+        "current_ready": r["ready"],
+        "models": [],
+    }
 
 
-@app.get("/api/llm/keys")
-def list_llm_keys(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
-    """列出当前用户的 key 状态(每个 provider 一行)。"""
-    db_meta = {m["env_var"]: m for m in STATE.db.list_user_api_keys_meta(identity.username)}
-    providers: dict[str, dict[str, Any]] = {}
-    for m in KNOWN_MODELS:
-        if not m.api_key_env:
-            continue
-        if m.api_key_env in providers:
-            providers[m.api_key_env]["models"].append(m.id)
-            continue
-        own_meta = db_meta.get(m.api_key_env)
-        env_val = os.environ.get(m.api_key_env, "").strip()
-        own_tail = own_meta["tail"] if own_meta else None
-        env_tail = env_val[-4:] if env_val else None
-        providers[m.api_key_env] = {
-            "env_var": m.api_key_env,
-            "provider": m.provider,
-            "models": [m.id],
-            "configured": bool(own_meta or env_val),
-            "source": ("user" if own_meta else ("env" if env_val else None)),
-            "tail": own_tail or env_tail,
-            "updated_at": (own_meta["updated_at"] if own_meta else None),
-            "has_personal": bool(own_meta),
-            "has_env_fallback": bool(env_val),
-        }
-    return {"providers": list(providers.values())}
+@app.get("/api/llm/settings")
+def get_llm_settings(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+    """当前用户的 LLM 设置三元组 + .env 兜底信息 + 模型示例(供下拉)。
+    key 只回 has_key 布尔,绝不回真值。"""
+    r = _resolve_user_llm(identity)
+    return {
+        "has_key": r["has_user_key"],
+        "base_url": r["user_base_url"],
+        "model": r["user_model"],
+        "effective_model": r["model"],
+        "effective_ready": r["ready"],
+        "key_source": r["key_source"],
+        "env_has_key": r["env_has_key"],
+        "env_model": r["env_model"],
+        "env_base_url": r["env_base_url"],
+        "updated_at": r["updated_at"],
+        "suggestions": [
+            {"id": m.id, "display": m.display, "notes": m.notes,
+             "location": m.location, "cost": m.cost}
+            for m in KNOWN_MODELS
+        ],
+    }
 
 
-@app.put("/api/llm/keys/{env_var}")
-def upsert_llm_key(
-    env_var: str,
-    req: ApiKeyRequest,
+@app.put("/api/llm/settings")
+def put_llm_settings(
+    req: LlmSettingsRequest,
     identity: Identity = Depends(current_identity),
 ) -> dict[str, Any]:
-    """写入当前用户自己的 key。所有登录用户都能操作自己的。"""
-    value = (req.value or "").strip()
-    if not value:
-        raise HTTPException(400, "key 不能为空")
-    valid = {m.api_key_env for m in KNOWN_MODELS if m.api_key_env}
-    if env_var not in valid:
-        raise HTTPException(400, f"未知 env_var: {env_var}")
-    STATE.db.upsert_user_api_key(identity.username, env_var, value)
-    STATE.db.write_audit(
-        username=identity.username, action="set_api_key",
-        question=f"env_var={env_var}",
+    """保存当前用户的三元组。api_key=None→保持原值;""→清空;非空→更新。
+    base_url / model 总是按表单值写入(空串=清空,回退 .env)。"""
+    STATE.db.set_user_llm_settings(
+        identity.username,
+        api_key=req.api_key,
+        base_url=req.base_url,
+        model=req.model,
     )
-    return {"ok": True, "env_var": env_var, "tail": value[-4:]}
+    STATE.db.write_audit(
+        username=identity.username, action="set_llm_settings",
+        question=f"model={req.model or '(env)'} base_url={'set' if req.base_url else '(env)'}",
+    )
+    return get_llm_settings(identity)
 
 
-@app.post("/api/llm/keys/{env_var}/test")
-def test_llm_key(
-    env_var: str,
-    identity: Identity = Depends(current_identity),
-) -> dict[str, Any]:
-    """对当前 env_var 关联的某个模型发一次最短调用,验证当前用户的 key 真有效。"""
-    valid_envs = {m.api_key_env for m in KNOWN_MODELS if m.api_key_env}
-    if env_var not in valid_envs:
-        raise HTTPException(400, f"未知 env_var: {env_var}")
-
-    target = next((m for m in KNOWN_MODELS if m.api_key_env == env_var), None)
-    if target is None:
-        raise HTTPException(400, "未找到关联模型")
-
-    key_val, source = _effective_key(identity.username, env_var)
-    if not key_val:
+@app.post("/api/llm/settings/test")
+def test_llm_settings(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+    """用当前生效配置发一次最短调用,验证 key/端点/模型真能用。"""
+    r = _resolve_user_llm(identity)
+    if not r["ready"]:
         return {
-            "ok": False,
-            "error": f"{env_var} 未配置 —— 先在上方点「配置」保存你自己的 key",
-            "category": "not_configured",
+            "ok": False, "category": "not_configured",
+            "error": "尚未配置:至少需要 Model + (API key 或 Base URL)。",
         }
-
-    import litellm
+    client = _build_user_llm(identity)
     t0 = time.monotonic()
     try:
-        resp = litellm.completion(
-            model=target.id,
+        resp = client.complete(
             messages=[
                 {"role": "system", "content": "你是测试助手,只回复'OK'两个字。"},
                 {"role": "user", "content": "ping"},
             ],
-            timeout=20,
             max_tokens=8,
-            api_key=key_val,                # 显式传,不依赖 os.environ
         )
         dt = int((time.monotonic() - t0) * 1000)
-        text = (resp.choices[0].message.content or "").strip()
         return {
-            "ok": True,
-            "model": target.id,
-            "key_source": source,
-            "latency_ms": dt,
-            "reply": text[:50],
+            "ok": True, "model": r["model"], "key_source": r["key_source"],
+            "latency_ms": dt, "reply": (resp.text or "").strip()[:50],
         }
     except Exception as e:                              # noqa: BLE001
         dt = int((time.monotonic() - t0) * 1000)
-        msg = str(e)
-        cat = "other"
-        lower = msg.lower()
+        msg = str(e); lower = msg.lower(); cat = "other"
         if any(k in lower for k in ("auth", "invalid api key", "401", "unauthorized")):
             cat = "auth"
-        elif any(k in lower for k in ("timeout", "connect", "network", "dns", "ssl", "10054", "10060")):
+        elif any(k in lower for k in ("timeout", "connect", "network", "dns", "ssl", "10054", "10060", "getaddrinfo")):
             cat = "network"
         elif any(k in lower for k in ("rate limit", "429", "quota")):
             cat = "rate_limit"
         return {
-            "ok": False,
-            "model": target.id,
-            "key_source": source,
-            "latency_ms": dt,
-            "error": msg[:500],
-            "category": cat,
+            "ok": False, "model": r["model"], "key_source": r["key_source"],
+            "latency_ms": dt, "error": msg[:500], "category": cat,
         }
-
-
-@app.delete("/api/llm/keys/{env_var}")
-def delete_llm_key(
-    env_var: str,
-    identity: Identity = Depends(current_identity),
-) -> dict[str, Any]:
-    """清除当前用户自己的 key。"""
-    STATE.db.delete_user_api_key(identity.username, env_var)
-    STATE.db.write_audit(
-        username=identity.username, action="delete_api_key",
-        question=f"env_var={env_var}",
-    )
-    return {"ok": True}
-
-
-@app.post("/api/llm/model")
-def switch_llm_model(
-    req: SwitchModelRequest,
-    identity: Identity = Depends(current_identity),
-) -> dict[str, Any]:
-    """切换全局当前模型 —— 不接受 api_key/api_base (key 走 §私人 keys,base 走 .env)。"""
-    info = find_model(req.model)
-    if info is None:
-        log.warning("切换到注册表外的模型: %s", req.model)
-    STATE.llm.switch_model(req.model)
-    STATE.db.write_audit(
-        username=identity.username, action="switch_model",
-        llm_model=req.model,
-    )
-    # 返回视图:用 list_llm_models 的逻辑,带上当前用户的 ready 视图
-    return list_llm_models(identity)
 
 
 # ============================== /api/skills ==============================
@@ -1244,17 +1202,12 @@ def chat_endpoint(
             identity=identity,
             t0=t0,
         )
-    # 取当前用户的有效 key (个人 > .env fallback)
-    cur_env = next(
-        (m.api_key_env for m in KNOWN_MODELS if m.id == STATE.llm.model), ""
-    )
-    user_key, key_source = (None, None)
-    if cur_env:
-        user_key, key_source = _effective_key(identity.username, cur_env)
-    if cur_env and not user_key:
+    # 取当前用户的有效 LLM 配置 (用户三元组 > .env 兜底)
+    cfg = _resolve_user_llm(identity)
+    if not cfg["ready"]:
         STATE.db.finish_task(
             task_id, status="failed",
-            error=f"当前模型 {STATE.llm.model} 需要 {cur_env},但你还没配置。请到「我的 API Keys」配置或切到本地模型。",
+            error=f"模型 {cfg['model'] or '(未设置)'} 未就绪:请到「🔑 LLM 设置」配置 API key + Base URL + Model,或在 .env 设默认。",
             row_count=0, latency_ms=int((time.monotonic() - t0) * 1000),
         )
         return {
@@ -1264,17 +1217,14 @@ def chat_endpoint(
             "tool_calls": [],
             "input_tokens": 0,
             "output_tokens": 0,
-            "llm_model": STATE.llm.model,
-            "error": f"未配置 {cur_env}",
+            "llm_model": cfg["model"],
+            "error": "LLM 未配置",
             "error_category": "not_configured",
             "task": None,
         }
 
-    # per-request LLMClient: 共用全局当前 model,key 用当前用户私有
-    user_llm = LLMClient(STATE.settings.llm)
-    user_llm.model = STATE.llm.model
-    user_llm.api_key = user_key
-    user_llm.api_base = STATE.llm.api_base
+    # per-request LLMClient: 用当前用户的三元组
+    user_llm = _build_user_llm(identity)
     # 加载历史 (排除刚加进去的当前 user 消息)
     prior_msgs = STATE.db.list_task_messages(task_id)
     history_text: list[tuple[str, str]] = []
@@ -1295,7 +1245,7 @@ def chat_endpoint(
         error=(result.task.error if result.task and result.task.status != "done" else None),
         row_count=(result.task.row_count if result.task else 0),
         latency_ms=latency_ms,
-        llm_model=STATE.llm.model,
+        llm_model=user_llm.model,
         llm_input_tokens=result.total_input_tokens,
         llm_output_tokens=result.total_output_tokens,
     )
@@ -1335,7 +1285,7 @@ def chat_endpoint(
         task_id=task_id, question=req.message,
         row_count=(result.task.row_count if result.task else 0),
         latency_ms=latency_ms,
-        llm_model=STATE.llm.model,
+        llm_model=user_llm.model,
         llm_tokens=result.total_input_tokens + result.total_output_tokens,
         ip=request.client.host if request.client else None,
     )
@@ -1349,7 +1299,7 @@ def chat_endpoint(
         ],
         "input_tokens": result.total_input_tokens,
         "output_tokens": result.total_output_tokens,
-        "llm_model": STATE.llm.model,
+        "llm_model": user_llm.model,
         "task": {
             "status": result.task.status if result.task else "failed",
             "row_count": result.task.row_count if result.task else 0,
@@ -1361,6 +1311,249 @@ def chat_endpoint(
             } if result.task and result.task.excel else None),
         } if result.task else None,
     }
+
+
+# ============================== /api/chat/stream (SSE, JSON-action) ==============================
+
+# 让 SSE 逐 token 直达浏览器,不被反代/CDN 缓冲成一坨。X-Accel-Buffering 是 nginx
+# 唯一逐响应生效的开关;no-transform 阻止压缩(压缩会重新缓冲)。
+SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+
+
+def _diagnostic_hint(exc: Exception) -> str:
+    """把常见失败映射成一句人话提示(指向最可能的原因,不是排障树)。"""
+    name = type(exc).__name__
+    msg = str(exc).lower()
+    if "apikey" in msg or "api_key" in msg or "unauthorized" in msg or "authentication" in msg or name == "AuthenticationError":
+        return "LLM 拒绝了凭据。请到「我的 API Keys」检查 key 是否正确。"
+    if "timeout" in msg or name in ("TimeoutError", "ReadTimeout", "ConnectTimeout"):
+        return "LLM 调用超时。供应商可能较慢 —— 重试,或换一个更快的模型。"
+    if "rate" in msg and "limit" in msg:
+        return "调用过于频繁被限流。等几秒再试。"
+    if "connection" in msg or "getaddrinfo" in msg or "name or service" in msg:
+        return "连不上 LLM 端点。检查网络与 base URL(国内直连模型/代理是否正常)。"
+    if "json" in msg and ("decode" in msg or "parse" in msg):
+        return "模型返回了非法 JSON。再发一次通常会自我纠正。"
+    return ""
+
+
+def _register_excel_cb(task_id: str):
+    """给 StreamAgent 的 on_excel 回调:把产出的 Excel 登记进 DB,返回前端可用 payload。"""
+    def cb(task: TaskResult) -> dict[str, Any]:
+        if task.excel:
+            STATE.db.add_task_file(
+                task_id, filename=task.excel.path.name, path=str(task.excel.path),
+                size_bytes=task.excel.size_bytes, preview=task.rows_preview[:50],
+            )
+        return {
+            "task_id": task_id,
+            "status": task.status,
+            "row_count": task.row_count,
+            "rows_preview": task.rows_preview[:50],
+            "excel": ({
+                "filename": task.excel.path.name,
+                "size_bytes": task.excel.size_bytes,
+                "download_url": f"/api/tasks/{task_id}/file",
+            } if task.excel else None),
+        }
+    return cb
+
+
+@app.post("/api/chat/stream")
+async def chat_stream_endpoint(
+    req: ChatRequest,
+    request: Request,
+    identity: Identity = Depends(current_identity),
+):
+    """LLM 驱动的自由对话 —— SSE 流式 (JSON-action 协议, 对标 DataAgent)。
+
+    与 /api/chat 同源:配额 / 建-续 task / 落消息 / 个人 key / 报告清单快捷都复用,
+    只是把"跑完一次性返回"换成"逐事件 yield"。前端用 fetch+getReader 解析。
+    """
+    from fastapi.responses import StreamingResponse
+
+    t0 = time.monotonic()
+    from datetime import UTC, datetime as _dt
+    month = _dt.now(UTC).strftime("%Y-%m")
+    limit = STATE.db.get_user_quota_limit(identity.username)
+    if limit is not None:
+        used = STATE.db.get_user_quota_usage(identity.username, month)
+        if used["input_tokens"] + used["output_tokens"] >= limit:
+            raise HTTPException(429, f"本月 LLM token 配额已用完 ({limit})。请联系管理员调整。")
+
+    # 多轮:带 task_id 且属于自己的 chat task → 续;否则新建。
+    task_id: str | None = None
+    if req.task_id:
+        row = STATE.db.get_task(req.task_id)
+        if row and row.get("username") == identity.username and row.get("source") == "chat":
+            task_id = req.task_id
+    if not task_id:
+        task_id = STATE.db.create_task(
+            username=identity.username, source="chat", question=req.message,
+        )
+
+    STATE.db.add_task_message(task_id, role="user", text=req.message)
+    TASK_BUS.publish(task_id, {"type": "user_message", "text": req.message})
+
+    is_report = _is_report_list_query(req.message)
+
+    # 当前用户的有效 LLM 配置(报告清单快捷不需要 LLM)。
+    cfg = _resolve_user_llm(identity)
+    llm_model = cfg["model"]
+
+    history_text: list[tuple[str, str]] = []
+    prior_msgs = STATE.db.list_task_messages(task_id)
+    for m in prior_msgs[:-1]:                       # 最后一条是刚加的 user message
+        if m.get("text"):
+            history_text.append((m["role"], m["text"]))
+
+    ip = request.client.host if request.client else None
+
+    async def event_stream():
+        events: list[dict[str, Any]] = []
+        final_text = ""
+        final_error = False
+        assistant_persisted = False
+
+        def sse(ev: dict[str, Any]) -> str:
+            return "data: " + json.dumps(ev, ensure_ascii=False, default=str) + "\n\n"
+
+        # 探活:先 flush 一个 SSE 注释,逼反代立即打开到客户端的管道。
+        yield ": sap-stream-open\n\n"
+        # 首个事件携带 task_id,让前端立刻知道这轮归属哪个 task(多轮续聊用)。
+        meta_ev = {"kind": "meta", "payload": {"task_id": task_id}}
+        events.append(meta_ev)
+        yield sse(meta_ev)
+
+        try:
+            # ── 报告清单快捷:不走 LLM,包成事件流(快捷函数自己已落 task+消息) ──
+            if is_report:
+                ev = {"kind": "progress", "payload": {
+                    "phase": "tool_start", "action": "report_list",
+                    "msg": "读取固定报告清单 OData…",
+                }}
+                events.append(ev)
+                yield sse(ev)
+                result = await asyncio.to_thread(
+                    _run_report_list_shortcut,
+                    task_id=task_id, req=req, request=request, identity=identity, t0=t0,
+                )
+                assistant_persisted = True                  # 快捷函数已落 assistant 消息
+                tb = result.get("task")
+                if tb and tb.get("excel"):
+                    tev = {"kind": "task", "payload": {**tb, "task_id": task_id}}
+                    events.append(tev)
+                    yield sse(tev)
+                final_text = result.get("answer", "")
+                fev = {"kind": "final", "payload": {"text": final_text}}
+                events.append(fev)
+                yield sse(fev)
+                return
+
+            # ── 未配置:友好失败 ──
+            if not cfg["ready"]:
+                final_text = (
+                    f"模型 {llm_model or '(未设置)'} 未就绪 —— 请到「🔑 LLM 设置」"
+                    "填好 API key + Base URL + Model(或在 .env 设默认)。"
+                )
+                final_error = True
+                fev = {"kind": "final", "payload": {
+                    "text": final_text, "error": True, "error_category": "not_configured",
+                }}
+                events.append(fev)
+                yield sse(fev)
+                return
+
+            # ── 正常 LLM 链路 ──
+            user_llm = _build_user_llm(identity)
+
+            agent = StreamAgent(
+                settings=STATE.settings, llm=user_llm, bw=STATE.bw,
+                skills=STATE.skills, orchestrator=STATE.orchestrator,
+                username=identity.username, role=identity.role,
+                on_excel=_register_excel_cb(task_id),
+            )
+            try:
+                async for step in agent.run_turn(req.message, history=history_text):
+                    ev = {"kind": step.kind, "payload": step.payload}
+                    events.append(ev)
+                    yield sse(ev)
+                    TASK_BUS.publish(task_id, {"type": step.kind, **step.payload})
+                    if step.kind == "final":
+                        final_text = step.payload.get("text", "")
+                        final_error = bool(step.payload.get("error"))
+            except asyncio.CancelledError:
+                final_text = "(客户端在智能体完成前断开了连接)"
+                events.append({"kind": "final", "payload": {"text": final_text, "cancelled": True}})
+                raise
+            except Exception as e:                          # noqa: BLE001
+                hint = _diagnostic_hint(e)
+                final_text = f"**智能体出错:** {type(e).__name__}: {e}"
+                if hint:
+                    final_text += f"\n\n💡 {hint}"
+                final_error = True
+                log.exception("agent stream crash task=%s msg=%r", task_id, req.message[:80])
+                fev = {"kind": "final", "payload": {
+                    "text": final_text, "error": True, "exc_type": type(e).__name__,
+                }}
+                events.append(fev)
+                yield sse(fev)
+
+            # 落 assistant 消息 + 收尾 task + 配额 + 审计。
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            last_task = agent.last_task
+            STATE.db.finish_task(
+                task_id,
+                status=("failed" if final_error else "done"),
+                error=(final_text if final_error else None),
+                row_count=(last_task.row_count if last_task else 0),
+                latency_ms=latency_ms,
+                llm_model=llm_model,
+                llm_input_tokens=agent.total_input_tokens,
+                llm_output_tokens=agent.total_output_tokens,
+            )
+            STATE.db.add_task_message(
+                task_id, role="assistant", text=final_text,
+                blocks={
+                    "events": events,
+                    "task": ({
+                        "status": last_task.status,
+                        "excel_filename": last_task.excel.path.name if last_task.excel else None,
+                        "row_count": last_task.row_count,
+                    } if last_task else None),
+                },
+            )
+            assistant_persisted = True
+            STATE.db.add_user_quota_usage(
+                identity.username, month,
+                input_tokens=agent.total_input_tokens,
+                output_tokens=agent.total_output_tokens,
+            )
+            STATE.db.write_audit(
+                username=identity.username, action="chat",
+                task_id=task_id, question=req.message,
+                row_count=(last_task.row_count if last_task else 0),
+                latency_ms=latency_ms, llm_model=llm_model,
+                llm_tokens=agent.total_input_tokens + agent.total_output_tokens,
+                ip=ip,
+            )
+        finally:
+            # 兜底:即便中途断开,也尽量留下一条 assistant 记录(否则历史里这轮丢失)。
+            if not assistant_persisted:
+                try:
+                    STATE.db.add_task_message(
+                        task_id, role="assistant",
+                        text=final_text or "(无输出)",
+                        blocks={"events": events, "cancelled": True},
+                    )
+                except Exception:                           # noqa: BLE001
+                    log.exception("流式收尾落 assistant 消息失败 task=%s", task_id)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 # ============================== /api/tasks ==============================

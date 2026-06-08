@@ -1,8 +1,9 @@
 // HTTP 客户端 —— 与 FastAPI /api/* 对接,统一错误处理
 import type {
-  Identity, LlmStatus, SkillSummary, SkillDetail, SkillRunResponse,
+  Identity, SkillSummary, SkillDetail, SkillRunResponse,
   ChatResponse, TaskListItem, AuditRow, SensitiveField, SystemStatus, BWService,
-  Favorite, TaskMessage, QuotaStatus, AdminQuotaRow, SkillSourceResp,
+  Favorite, TaskMessage, QuotaStatus, AdminQuotaRow, SkillSourceResp, AgentEvent,
+  LlmSettings, LlmTestResult,
 } from "./types";
 
 class ApiError extends Error {
@@ -39,6 +40,62 @@ async function request<T>(
   return (await resp.json()) as T;
 }
 
+// SSE 解析:fetch + getReader,按 \n\n 切事件块,只取 data: 行。
+// 返回这轮的 task_id(从 meta/task 事件嗅探),供前端续聊与跳转。
+async function streamChat(
+  message: string,
+  task_id: string | undefined,
+  onEvent: (ev: AgentEvent) => void,
+  signal?: AbortSignal,
+): Promise<{ task_id: string | null }> {
+  const resp = await fetch("/api/chat/stream", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, task_id: task_id ?? null }),
+    signal,
+  });
+  if (!resp.ok || !resp.body) {
+    let msg = `${resp.status}`;
+    try {
+      const j = await resp.json();
+      msg = j?.detail || j?.message || msg;
+    } catch {
+      // ignore
+    }
+    throw new ApiError(resp.status, msg);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let resolvedTaskId: string | null = task_id ?? null;
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 2);
+      if (!block.startsWith("data:")) continue; // 忽略 ": ..." 探活注释
+      const payload = block.slice(5).trim();
+      if (!payload) continue;
+      let ev: AgentEvent;
+      try {
+        ev = JSON.parse(payload) as AgentEvent;
+      } catch {
+        continue;
+      }
+      const tid = (ev.payload as { task_id?: string })?.task_id;
+      if (tid) resolvedTaskId = tid;
+      onEvent(ev);
+    }
+  }
+  return { task_id: resolvedTaskId };
+}
+
 export const api = {
   // ---------- system ----------
   status: () => request<SystemStatus>("GET", "/api/status"),
@@ -49,41 +106,12 @@ export const api = {
   logout: () => request<{ ok: boolean }>("POST", "/api/auth/logout"),
   me: () => request<Identity>("GET", "/api/auth/me"),
 
-  // ---------- llm ----------
-  listModels: () => request<LlmStatus>("GET", "/api/llm/models"),
-  switchModel: (model: string) =>
-    request<LlmStatus>("POST", "/api/llm/model", { model }),
-
-  // LLM provider API keys (per-user)
-  listLlmKeys: () =>
-    request<{ providers: Array<{
-      env_var: string;
-      provider: string;
-      models: string[];
-      configured: boolean;
-      source: "user" | "env" | null;
-      tail: string | null;
-      updated_at: string | null;
-      has_personal: boolean;
-      has_env_fallback: boolean;
-    }> }>("GET", "/api/llm/keys"),
-  setLlmKey: (env_var: string, value: string) =>
-    request<{ ok: boolean; env_var: string; tail: string }>(
-      "PUT",
-      `/api/llm/keys/${encodeURIComponent(env_var)}`,
-      { value },
-    ),
-  deleteLlmKey: (env_var: string) =>
-    request<{ ok: boolean }>("DELETE", `/api/llm/keys/${encodeURIComponent(env_var)}`),
-  testLlmKey: (env_var: string) =>
-    request<{
-      ok: boolean;
-      model?: string;
-      latency_ms?: number;
-      reply?: string;
-      error?: string;
-      category?: "auth" | "network" | "rate_limit" | "not_configured" | "other";
-    }>("POST", `/api/llm/keys/${encodeURIComponent(env_var)}/test`),
+  // ---------- llm 设置 (DataAgent 式 BYOK: key + base_url + model 三元组) ----------
+  getLlmSettings: () => request<LlmSettings>("GET", "/api/llm/settings"),
+  saveLlmSettings: (body: { api_key?: string | null; base_url: string; model: string }) =>
+    request<LlmSettings>("PUT", "/api/llm/settings", body),
+  testLlmSettings: () =>
+    request<LlmTestResult>("POST", "/api/llm/settings/test"),
 
   // ---------- skills ----------
   listSkills: (q?: string) =>
@@ -110,6 +138,14 @@ export const api = {
   // ---------- chat ----------
   chat: (message: string, task_id?: string) =>
     request<ChatResponse>("POST", "/api/chat", { message, task_id }),
+  // 流式对话:POST /api/chat/stream 返回 text/event-stream,逐事件回调。
+  // 返回最终建立/沿用的 task_id(从 task / final 事件里嗅探)。
+  streamChat: (
+    message: string,
+    task_id: string | undefined,
+    onEvent: (ev: AgentEvent) => void,
+    signal?: AbortSignal,
+  ) => streamChat(message, task_id, onEvent, signal),
 
   // ---------- tasks ----------
   listTasks: () =>

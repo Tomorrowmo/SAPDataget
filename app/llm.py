@@ -12,7 +12,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 
 import litellm
 
@@ -174,6 +174,9 @@ class LLMClient:
         self.api_base = settings.api_base
         self.api_key = settings.api_key
         self.timeout = settings.timeout
+        # 流式补全时从最后一个 chunk 捕获的用量 (供配额统计)；不支持的 provider 留 0。
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
 
     def describe(self) -> str:
         info = find_model(self.model)
@@ -229,6 +232,19 @@ class LLMClient:
             ],
         }
 
+    def _apply_endpoint(self, kwargs: dict[str, Any]) -> None:
+        """注入 api_key / api_base。设了自定义 base_url(DataAgent 式 BYOK)就强制走
+        OpenAI 兼容路由 —— 让任意端点 + 任意模型名都能用,并去掉 model 的 provider 前缀。
+        没设 base_url 时保持 litellm 按 model 前缀(deepseek/ dashscope/ …)自动路由。"""
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+            kwargs["custom_llm_provider"] = "openai"
+            m = kwargs.get("model", self.model)
+            if isinstance(m, str) and "/" in m:
+                kwargs["model"] = m.split("/", 1)[1]
+
     def complete(
         self,
         messages: list[dict[str, Any]],
@@ -244,16 +260,57 @@ class LLMClient:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = kw.pop("tool_choice", "auto")
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
+        self._apply_endpoint(kwargs)
         kwargs.update(kw)
 
         raw = litellm.completion(**kwargs)
         resp = _parse_response(raw)
         resp.model = self.model
         return resp
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 2000,
+        **kw: Any,
+    ) -> AsyncIterator[str]:
+        """流式补全 —— 逐 token yield delta.content。
+
+        JSON-action 协议下不传 tools：模型只吐一段 JSON 文本,我们边收边用正则
+        抠出半成品 thought / answer 推给前端做打字机效果。LiteLLM 的
+        ``acompletion(stream=True)`` 在各 provider (deepseek/dashscope/anthropic/
+        openai/ollama) 上统一返回异步 chunk 流。
+        """
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "timeout": self.timeout,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+            # 让最后一个 chunk 带 usage；不支持的 provider 由 drop_params 自动剥离。
+            "stream_options": {"include_usage": True},
+        }
+        self._apply_endpoint(kwargs)
+        kwargs.update(kw)
+
+        resp = await litellm.acompletion(**kwargs)
+        async for chunk in resp:
+            usage = getattr(chunk, "usage", None)
+            if usage:
+                self.last_input_tokens = getattr(usage, "prompt_tokens", 0) or self.last_input_tokens
+                self.last_output_tokens = getattr(usage, "completion_tokens", 0) or self.last_output_tokens
+            try:
+                delta = chunk.choices[0].delta
+                content = getattr(delta, "content", None)
+            except (AttributeError, IndexError):
+                content = None
+            if content:
+                yield content
 
 
 # ============================== Helpers ==============================

@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import uuid
@@ -93,6 +94,16 @@ CREATE TABLE IF NOT EXISTS llm_api_keys (
   value_b64   TEXT NOT NULL,                 -- base64 混淆后的 key
   updated_at  TEXT DEFAULT (datetime('now')),
   PRIMARY KEY (username, env_var)
+);
+
+-- 每用户一组 LLM 设置三元组 (对标 DataAgent BYOK): key + base_url + model,
+-- 指向任意 OpenAI 兼容端点。任一字段留空则回退 .env 默认。key base64 混淆暂存。
+CREATE TABLE IF NOT EXISTS user_llm_settings (
+  username    TEXT PRIMARY KEY,
+  api_key_b64 TEXT,                          -- base64 混淆后的 key (NULL=清空,用 .env 兜底)
+  base_url    TEXT,                          -- OpenAI 兼容端点 (NULL/空=用 .env)
+  model       TEXT,                          -- 模型名 (NULL/空=用 .env)
+  updated_at  TEXT DEFAULT (datetime('now'))
 );
 
 -- 自由对话/多轮的消息历史 (一个 task = 一段会话)
@@ -389,6 +400,58 @@ class DB:
             cur.execute(
                 "DELETE FROM llm_api_keys WHERE username=? AND env_var=?",
                 (username, env_var),
+            )
+
+    # ---------- 每用户 LLM 设置三元组 (DataAgent 式 BYOK) ----------
+    def get_user_llm_settings(self, username: str) -> dict[str, Any] | None:
+        """返回 {api_key, base_url, model, updated_at};无记录返回 None。
+        api_key 已解码(可能为 None=未设私有 key)。"""
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT api_key_b64, base_url, model, updated_at "
+                "FROM user_llm_settings WHERE username=?",
+                (username,),
+            ).fetchone()
+        if not row:
+            return None
+        api_key: str | None = None
+        if row["api_key_b64"]:
+            try:
+                api_key = base64.b64decode(row["api_key_b64"]).decode("utf-8")
+            except Exception:                                  # noqa: BLE001
+                api_key = None
+        return {
+            "api_key": api_key,
+            "base_url": row["base_url"] or "",
+            "model": row["model"] or "",
+            "updated_at": row["updated_at"],
+        }
+
+    def set_user_llm_settings(
+        self,
+        username: str,
+        *,
+        api_key: str | None = None,        # None=保持原值;""=清空;非空=更新
+        base_url: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        cur_row = self.get_user_llm_settings(username) or {}
+        # api_key: None 保持原值,空串清空,非空更新
+        if api_key is None:
+            new_key = cur_row.get("api_key")
+        else:
+            new_key = api_key.strip() or None
+        new_b64 = base64.b64encode(new_key.encode("utf-8")).decode("ascii") if new_key else None
+        new_base = (base_url if base_url is not None else cur_row.get("base_url", "")) or None
+        new_model = (model if model is not None else cur_row.get("model", "")) or None
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO user_llm_settings(username, api_key_b64, base_url, model, updated_at) "
+                "VALUES(?,?,?,?,datetime('now')) "
+                "ON CONFLICT(username) DO UPDATE SET "
+                "  api_key_b64=excluded.api_key_b64, base_url=excluded.base_url, "
+                "  model=excluded.model, updated_at=excluded.updated_at",
+                (username, new_b64, new_base, new_model),
             )
 
     # ---------- task messages (自由对话多轮) ----------

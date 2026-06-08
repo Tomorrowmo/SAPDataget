@@ -6,21 +6,46 @@ export interface Identity {
   role: "user" | "admin";
 }
 
-export interface ModelInfo {
-  id: string;
-  display: string;
-  provider: string;
-  location: string;
-  cost: string;
-  notes: string;
-  ready: boolean;
-}
-
+// /api/status 里的 llm 块(保留 current/current_ready 字段名,models 已弃用)
 export interface LlmStatus {
   current: string;
   current_display: string;
   current_ready: boolean;
-  models: ModelInfo[];
+  models: unknown[];
+}
+
+// 模型示例(供设置页下拉,非强制)
+export interface ModelSuggestion {
+  id: string;
+  display: string;
+  notes: string;
+  location: string;
+  cost: string;
+}
+
+// DataAgent 式每用户 LLM 设置三元组 (GET /api/llm/settings)
+export interface LlmSettings {
+  has_key: boolean;            // 用户是否设了私有 key
+  base_url: string;            // 用户设的 base_url(空=用 .env)
+  model: string;               // 用户设的 model(空=用 .env)
+  effective_model: string;     // 实际生效的模型
+  effective_ready: boolean;    // 是否就绪(可发起对话)
+  key_source: "user" | "env" | null;
+  env_has_key: boolean;
+  env_model: string;
+  env_base_url: string;
+  updated_at?: string | null;
+  suggestions: ModelSuggestion[];
+}
+
+export interface LlmTestResult {
+  ok: boolean;
+  model?: string;
+  key_source?: "user" | "env" | null;
+  latency_ms?: number;
+  reply?: string;
+  error?: string;
+  category?: "auth" | "network" | "rate_limit" | "not_configured" | "other";
 }
 
 export interface SkillParam {
@@ -167,6 +192,7 @@ export interface TaskMessage {
   text: string | null;
   blocks: {
     tool_calls?: ToolCallTrace[];
+    events?: AgentEvent[];
     task?: {
       status: string;
       excel_filename?: string | null;
@@ -174,6 +200,22 @@ export interface TaskMessage {
     } | null;
   } | null;
   created_at: string;
+}
+
+// ---------- 流式 SSE 事件 (对标 DataAgent AgentStep) ----------
+// kind: progress | thought_delta | answer_delta | thought | tool_call | tool_result | task | final
+export interface AgentEvent {
+  kind: string;
+  payload: Record<string, unknown>;
+}
+
+// task 事件 / 历史复原时的任务块
+export interface ChatTaskPayload {
+  task_id?: string;
+  status?: "done" | "failed" | string;
+  row_count?: number;
+  rows_preview?: Record<string, unknown>[];
+  excel?: ExcelRef | null;
 }
 
 export interface QuotaStatus {

@@ -58,7 +58,8 @@ def test_status(client: httpx.Client):
     data = r.json()
     assert data["bw_mode"] == "mock"
     assert data["skills_count"] >= 3
-    assert len(data["llm"]["models"]) >= 5
+    # DataAgent 式设置后,llm 块改为 current/current_ready(models 已弃用)
+    assert "current" in data["llm"] and "current_ready" in data["llm"]
 
 
 def test_unauthorized(client: httpx.Client):
@@ -149,22 +150,13 @@ def test_service_metadata(logged_in: httpx.Client):
     assert "SalesByOfficeView" in es
 
 
-def test_llm_switch_model(logged_in: httpx.Client):
-    # 切到 qwen-plus
-    r = logged_in.post(
-        "/api/llm/model",
-        json={"model": "dashscope/qwen-plus"},
-    )
-    assert r.status_code == 200
-    assert r.json()["current"] == "dashscope/qwen-plus"
-
-    # 切回 deepseek
-    r2 = logged_in.post(
-        "/api/llm/model",
-        json={"model": "deepseek/deepseek-chat"},
-    )
-    assert r2.status_code == 200
-    assert r2.json()["current"] == "deepseek/deepseek-chat"
+def test_llm_settings_get(logged_in: httpx.Client):
+    """DataAgent 式三元组设置:GET 返回 has_key/model/effective + 模型示例。"""
+    r = logged_in.get("/api/llm/settings")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "has_key" in body and "effective_model" in body and "effective_ready" in body
+    assert isinstance(body["suggestions"], list) and len(body["suggestions"]) >= 5
 
 
 def test_admin_endpoints_require_admin(client: httpx.Client):
@@ -193,72 +185,49 @@ def test_admin_audit_and_sensitive(logged_in: httpx.Client):
     assert not any(f["field"] == "SALARY_BASE" for f in listed2)
 
 
-def test_llm_keys_list(logged_in: httpx.Client):
-    """所有登录用户可查 key 状态(只读)"""
-    r = logged_in.get("/api/llm/keys")
-    assert r.status_code == 200
-    providers = r.json()["providers"]
-    env_vars = {p["env_var"] for p in providers}
-    assert {"DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"}.issubset(env_vars)
-
-
-def test_llm_keys_per_user_isolation(client: httpx.Client):
-    """alice 的 key 不应影响 bob —— 每用户独立"""
-    # alice 配 key
+def test_llm_settings_per_user_isolation(client: httpx.Client):
+    """alice 的设置不应影响 bob —— 每用户独立(DataAgent 式三元组)。"""
+    # alice 配三元组
     client.post("/api/auth/login", json={"username": "alice", "password": ""})
-    r = client.put("/api/llm/keys/DASHSCOPE_API_KEY", json={"value": "sk-alice-key-xxxxxxxx"})
+    r = client.put("/api/llm/settings", json={
+        "api_key": "sk-alice-key-xxxxxxxx",
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+    })
     assert r.status_code == 200, r.text
-    alice_models = client.get("/api/llm/models").json()["models"]
-    qwen = next(m for m in alice_models if m["id"] == "dashscope/qwen-max")
-    assert qwen["ready"] is True
+    a = r.json()
+    assert a["has_key"] is True and a["model"] == "deepseek-chat" and a["effective_ready"] is True
 
-    # bob 登录,不应看到 alice 的 key
+    # bob 登录,不应继承 alice 的设置
     client.post("/api/auth/login", json={"username": "bob", "password": ""})
-    bob_models = client.get("/api/llm/models").json()["models"]
-    qwen_b = next(m for m in bob_models if m["id"] == "dashscope/qwen-max")
-    assert qwen_b["ready"] is False, "bob 不应继承 alice 的 key"
-
-    bob_keys = client.get("/api/llm/keys").json()["providers"]
-    bob_qwen = next(p for p in bob_keys if p["env_var"] == "DASHSCOPE_API_KEY")
-    assert bob_qwen["has_personal"] is False
+    b = client.get("/api/llm/settings").json()
+    assert b["has_key"] is False, "bob 不应继承 alice 的 key"
+    assert b["model"] == "", "bob 的 model 应为空(回退 .env)"
 
     # 清理
     client.post("/api/auth/login", json={"username": "alice", "password": ""})
-    client.delete("/api/llm/keys/DASHSCOPE_API_KEY")
+    client.put("/api/llm/settings", json={"api_key": "", "base_url": "", "model": ""})
 
 
-def test_llm_key_set_test_delete_self(logged_in: httpx.Client):
-    """普通流程:管理员配自己的 key + 列表查询 + 删除"""
-    r = logged_in.put("/api/llm/keys/DEEPSEEK_API_KEY", json={"value": "sk-fake-1234567890abcdef"})
-    assert r.status_code == 200
-    assert r.json()["tail"] == "cdef"
+def test_llm_settings_save_keep_and_clear_key(logged_in: httpx.Client):
+    """api_key 语义:非空更新 / null 保持 / 空串清空。"""
+    # 设 key + model
+    r = logged_in.put("/api/llm/settings", json={
+        "api_key": "sk-fake-1234567890abcdef", "base_url": "", "model": "deepseek/deepseek-chat",
+    })
+    assert r.status_code == 200 and r.json()["has_key"] is True
 
-    listed = logged_in.get("/api/llm/keys").json()["providers"]
-    ds = next(p for p in listed if p["env_var"] == "DEEPSEEK_API_KEY")
-    assert ds["has_personal"] is True
-    assert ds["source"] == "user"
-    assert ds["tail"] == "cdef"
+    # 只改 model,api_key=null → key 应保持
+    r2 = logged_in.put("/api/llm/settings", json={
+        "api_key": None, "base_url": "", "model": "dashscope/qwen-plus",
+    })
+    body2 = r2.json()
+    assert body2["has_key"] is True, "api_key=null 应保持原 key"
+    assert body2["model"] == "dashscope/qwen-plus"
 
-    models = logged_in.get("/api/llm/models").json()["models"]
-    ds_model = next(m for m in models if m["id"] == "deepseek/deepseek-chat")
-    assert ds_model["ready"] is True
-
-    # 删除
-    r2 = logged_in.delete("/api/llm/keys/DEEPSEEK_API_KEY")
-    assert r2.status_code == 200
-    models2 = logged_in.get("/api/llm/models").json()["models"]
-    ds_model2 = next(m for m in models2 if m["id"] == "deepseek/deepseek-chat")
-    assert ds_model2["ready"] is False
-
-
-def test_llm_key_unknown_env_rejected(logged_in: httpx.Client):
-    r = logged_in.put("/api/llm/keys/MADE_UP_API_KEY", json={"value": "x"})
-    assert r.status_code == 400
-
-
-def test_llm_key_empty_rejected(logged_in: httpx.Client):
-    r = logged_in.put("/api/llm/keys/DEEPSEEK_API_KEY", json={"value": ""})
-    assert r.status_code == 400
+    # api_key="" → 清空
+    r3 = logged_in.put("/api/llm/settings", json={"api_key": "", "base_url": "", "model": ""})
+    assert r3.json()["has_key"] is False, "api_key='' 应清空 key"
 
 
 def test_report_list_shortcut_works_without_llm(logged_in: httpx.Client):
