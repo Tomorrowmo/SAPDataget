@@ -73,10 +73,8 @@ class Settings:
         if self.bw.mode == "live":
             if not self.bw.base_url:
                 errors.append("BW_MODE=live 但 BW_BASE_URL 未设置")
-            if not self.bw.username:
-                errors.append("BW_MODE=live 但 BW_USERNAME 未设置")
-            if not self.bw.password:
-                errors.append("BW_MODE=live 但 BW_PASSWORD 未设置")
+            # live 模式默认走“登录用户凭据”访问 SAP；
+            # 因此启动期不再强制 BW_USERNAME/BW_PASSWORD（仍可作为兜底配置保留）。
         if self.bw.mode == "mock" and not self.bw.mock_data_dir.exists():
             errors.append(f"MOCK_DATA_DIR 不存在: {self.bw.mock_data_dir}")
         return errors

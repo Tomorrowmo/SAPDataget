@@ -34,9 +34,11 @@ import logging
 import os
 import re
 import time
+from xml.etree import ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+import requests
 from fastapi import (
     Cookie, Depends, FastAPI, File, HTTPException, Request,
     Response, UploadFile, status,
@@ -58,6 +60,7 @@ from app.config import BWSettings, load_settings, Settings
 from app.db import DB
 from app.llm import LLMClient, KNOWN_MODELS, find_model, model_ready
 from app.orchestrator import TaskOrchestrator
+from app.query_limits import parse_requested_top
 from app.skills.registry import SkillRegistry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -130,10 +133,28 @@ async def on_startup() -> None:
 # ============================== 身份依赖 ==============================
 
 COOKIE_NAME = "bw_session"
-REPORT_LIST_SERVICE = "ZBW_QUERY_LIST_SRV"
-REPORT_LIST_ENTITY_SET = "LtResultSet"
+REPORT_LIST_SERVICE = os.environ.get("REPORT_LIST_SERVICE", "ZBW_QUERY_LIST_SRV")
+REPORT_LIST_ENTITY_SET = os.environ.get("REPORT_LIST_ENTITY_SET", "LtResultSet")
+REPORT_LIST_SKILL_ID = os.environ.get("REPORT_LIST_SKILL_ID", "report_list")
+REPORT_LIST_URL = os.environ.get(
+    "REPORT_LIST_URL",
+    "http://sapbd1app01.cn.schneider-electric.com:8000/sap/opu/odata/sap/ZBW_QUERY_LIST_SRV/LtResultSet",
+)
+
+try:
+    REPORT_LIST_DEFAULT_TOP = max(1, int(os.environ.get("REPORT_LIST_DEFAULT_TOP", "200")))
+except ValueError:
+    REPORT_LIST_DEFAULT_TOP = 200
+try:
+    REPORT_LIST_MAX_TOP = max(REPORT_LIST_DEFAULT_TOP, int(os.environ.get("REPORT_LIST_MAX_TOP", "2000")))
+except ValueError:
+    REPORT_LIST_MAX_TOP = 2000
+
 REPORT_LIST_QUERY_RE = re.compile(
-    r"报告(清单|列表)|报表(清单|列表)|report\s*list|query\s*list",
+    os.environ.get(
+        "REPORT_LIST_QUERY_RE",
+        r"报告(清单|列表)|报表(清单|列表)|report\s*list|query\s*list",
+    ),
     re.IGNORECASE,
 )
 
@@ -156,6 +177,98 @@ def require_admin(identity: Identity = Depends(current_identity)) -> Identity:
 
 def _is_report_list_query(message: str) -> bool:
     return bool(REPORT_LIST_QUERY_RE.search(message.strip()))
+
+
+def _extract_report_list_top(message: str) -> int:
+    return parse_requested_top(
+        message,
+        default_top=REPORT_LIST_DEFAULT_TOP,
+        max_top=REPORT_LIST_MAX_TOP,
+    )
+
+
+def _parse_report_list_xml(xml_text: str) -> tuple[list[dict[str, Any]], int | None]:
+    """Parse OData Atom/XML rows and optional total count."""
+    text = (xml_text or "").strip()
+    if not text.startswith("<"):
+        return [], None
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return [], None
+
+    rows: list[dict[str, Any]] = []
+    total_count: int | None = None
+
+    def _local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    for node in root.iter():
+        local = _local(node.tag)
+        if local == "count" and total_count is None:
+            try:
+                total_count = int((node.text or "").strip())
+            except ValueError:
+                total_count = None
+        if local != "entry":
+            continue
+        props = None
+        for child in node.iter():
+            if _local(child.tag) == "properties":
+                props = child
+                break
+        if props is None:
+            continue
+
+        row: dict[str, Any] = {}
+        for prop in list(props):
+            key = _local(prop.tag)
+            is_null = any(
+                attr_name.endswith("}null") and str(attr_val).lower() == "true"
+                for attr_name, attr_val in prop.attrib.items()
+            )
+            row[key] = None if is_null else (prop.text or "")
+        if row:
+            rows.append(row)
+
+    return rows, total_count
+
+
+def _fixed_odata_query_params() -> dict[str, str]:
+    params: dict[str, str] = {}
+    if STATE.settings.bw.client:
+        params["sap-client"] = STATE.settings.bw.client
+    if STATE.settings.bw.language:
+        params["sap-language"] = STATE.settings.bw.language
+    return params
+
+
+def _get_fixed_odata_with_fallback(username: str, password: str):
+    params = _fixed_odata_query_params()
+    headers = {"Accept": "application/atom+xml,application/xml,text/xml"}
+    timeout = STATE.settings.bw.timeout
+    verify = STATE.settings.bw.verify_ssl
+
+    r = requests.get(
+        REPORT_LIST_URL,
+        auth=(username, password),
+        headers=headers,
+        params=params,
+        timeout=timeout,
+        verify=verify,
+    )
+    # 兼容某些系统不接受 sap-client 的情况：失败时去掉 sap-client 再试一次。
+    if "sap-client" in params and r.status_code in (401, 403, 404):
+        fallback = {k: v for k, v in params.items() if k != "sap-client"}
+        r = requests.get(
+            REPORT_LIST_URL,
+            auth=(username, password),
+            headers=headers,
+            params=fallback,
+            timeout=timeout,
+            verify=verify,
+        )
+    return r
 
 
 def _bw_client_for_identity(identity: Identity):
@@ -187,11 +300,312 @@ def _run_report_list_shortcut(
     identity: Identity,
     t0: float,
 ) -> dict[str, Any]:
+    top_n = _extract_report_list_top(req.message)
     bw_client = _bw_client_for_identity(identity)
+
+    # live 模式: 按用户要求固定调用该 URL,先解析 OData XML,再取 5 条。
+    if STATE.settings.bw.mode == "live":
+        password = get_credentials(identity.username, cred_id=identity.cred_id, db=STATE.db)
+        if not password:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "BW 凭据已失效,请重新登录")
+
+        try:
+            raw_resp = _get_fixed_odata_with_fallback(identity.username, password)
+        except requests.RequestException as e:
+            raw_resp = None
+            raw_error = f"请求异常: {e}"
+        else:
+            raw_error = None
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        if raw_resp is None:
+            STATE.db.finish_task(
+                task_id,
+                status="failed",
+                error=raw_error,
+                row_count=0,
+                latency_ms=latency_ms,
+            )
+            return {
+                "task_id": task_id,
+                "answer": f"查询报告清单失败: {raw_error}",
+                "iterations": 1,
+                "tool_calls": [{
+                    "name": "fetch_report_list_fixed_url",
+                    "arguments": {"url": REPORT_LIST_URL},
+                    "is_error": True,
+                }],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "llm_model": "builtin/report-list",
+                "task": {
+                    "status": "failed",
+                    "row_count": 0,
+                    "rows_preview": [],
+                    "excel": None,
+                },
+            }
+
+        if raw_resp.status_code in (401, 403):
+            msg = f"HTTP {raw_resp.status_code}（用户名或密码无效，或无权限访问该 OData）"
+            STATE.db.finish_task(
+                task_id,
+                status="failed",
+                error=msg,
+                row_count=0,
+                latency_ms=latency_ms,
+            )
+            return {
+                "task_id": task_id,
+                "answer": f"查询报告清单失败: {msg}",
+                "iterations": 1,
+                "tool_calls": [{
+                    "name": "fetch_report_list_fixed_url",
+                    "arguments": {"url": REPORT_LIST_URL},
+                    "is_error": True,
+                }],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "llm_model": "builtin/report-list",
+                "task": {
+                    "status": "failed",
+                    "row_count": 0,
+                    "rows_preview": [],
+                    "excel": None,
+                },
+            }
+
+        rows_all, total_count = _parse_report_list_xml(raw_resp.text)
+        if not rows_all:
+            msg = f"固定 URL 返回非预期内容，无法解析 XML（HTTP {raw_resp.status_code}）"
+            STATE.db.finish_task(
+                task_id,
+                status="failed",
+                error=msg,
+                row_count=0,
+                latency_ms=latency_ms,
+            )
+            return {
+                "task_id": task_id,
+                "answer": f"查询报告清单失败: {msg}",
+                "iterations": 1,
+                "tool_calls": [{
+                    "name": "fetch_report_list_fixed_url",
+                    "arguments": {"url": REPORT_LIST_URL},
+                    "is_error": True,
+                }],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "llm_model": "builtin/report-list",
+                "task": {
+                    "status": "failed",
+                    "row_count": 0,
+                    "rows_preview": [],
+                    "excel": None,
+                },
+            }
+
+        rows = rows_all[:5]
+        row_count_total = total_count if total_count is not None else len(rows_all)
+        columns = list(rows[0].keys()) if rows else ["ReportID", "ReportDescription"]
+        free_result = STATE.orchestrator.run_free_query(
+            service=REPORT_LIST_SERVICE,
+            entity_set=REPORT_LIST_ENTITY_SET,
+            columns=columns,
+            rows=rows,
+            info={
+                "question": req.message,
+                "service": REPORT_LIST_SERVICE,
+                "entity_set": REPORT_LIST_ENTITY_SET,
+                "odata_url": REPORT_LIST_URL,
+                "row_count": len(rows),
+                "row_count_total": row_count_total,
+                "latency_ms": latency_ms,
+            },
+            sheet_title="报告清单",
+            username=identity.username,
+        )
+        answer = (
+            f"固定 OData 链接解析完成，共 {row_count_total} 条，"
+            f"现返回其中 5 条，并已生成 Excel。"
+        )
+        STATE.db.finish_task(
+            task_id,
+            status="done",
+            error=None,
+            row_count=len(rows),
+            latency_ms=latency_ms,
+            llm_model="builtin/report-list",
+            llm_input_tokens=0,
+            llm_output_tokens=0,
+        )
+        if free_result.excel:
+            STATE.db.add_task_file(
+                task_id,
+                filename=free_result.excel.path.name,
+                path=str(free_result.excel.path),
+                size_bytes=free_result.excel.size_bytes,
+                preview=rows,
+            )
+        STATE.db.add_task_message(
+            task_id,
+            role="assistant",
+            text=answer,
+            blocks={"tool_calls": [{
+                "name": "fetch_report_list_fixed_url",
+                "arguments": {"url": REPORT_LIST_URL},
+                "is_error": False,
+            }], "task": {
+                "status": "done",
+                "excel_filename": free_result.excel.path.name if free_result.excel else None,
+                "row_count": len(rows),
+            }},
+        )
+        TASK_BUS.publish(task_id, {
+            "type": "assistant_message",
+            "text": answer,
+            "iterations": 1,
+        })
+        STATE.db.write_audit(
+            username=identity.username,
+            action="chat",
+            task_id=task_id,
+            question=req.message,
+            service=REPORT_LIST_SERVICE,
+            odata_url=REPORT_LIST_URL,
+            row_count=len(rows),
+            latency_ms=latency_ms,
+            llm_model="builtin/report-list",
+            llm_tokens=0,
+            ip=request.client.host if request.client else None,
+        )
+        return {
+            "task_id": task_id,
+            "answer": answer,
+            "iterations": 1,
+            "tool_calls": [{
+                "name": "fetch_report_list_fixed_url",
+                "arguments": {"url": REPORT_LIST_URL},
+                "is_error": False,
+            }],
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "llm_model": "builtin/report-list",
+            "task": {
+                "status": "done",
+                "row_count": len(rows),
+                "rows_preview": rows,
+                "excel": ({
+                    "filename": free_result.excel.path.name,
+                    "size_bytes": free_result.excel.size_bytes,
+                    "download_url": f"/api/tasks/{task_id}/file",
+                } if free_result.excel else None),
+            },
+        }
+
+    # 优先走 Skill（统一参数校验、Excel、审计字段），若未配置 report_list skill 再回退直查。
+    result = None
+    try:
+        scoped_orchestrator = TaskOrchestrator(
+            STATE.settings,
+            bw_client,
+            STATE.skills,
+            sensitive_fields_resolver=STATE.orchestrator._sensitive_resolver,
+        )
+        result = scoped_orchestrator.run_skill(
+            REPORT_LIST_SKILL_ID,
+            {"top_n": top_n},
+            username=identity.username,
+            question=req.message,
+        )
+    except Exception as e:                              # noqa: BLE001
+        log.warning("report_list skill 执行异常,回退直查: %s", e)
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    if result and result.status == "done" and result.excel:
+        preview_rows = result.rows_preview[:50]
+        row_count = result.row_count or len(preview_rows)
+        answer = (
+            f"已查询到报告清单，共 {row_count} 条，"
+            f"已生成 Excel，下面展示前 {len(preview_rows)} 条。"
+        )
+        STATE.db.finish_task(
+            task_id,
+            status="done",
+            error=None,
+            row_count=row_count,
+            latency_ms=latency_ms,
+            llm_model="builtin/report-list",
+            llm_input_tokens=0,
+            llm_output_tokens=0,
+        )
+        STATE.db.add_task_file(
+            task_id,
+            filename=result.excel.path.name,
+            path=str(result.excel.path),
+            size_bytes=result.excel.size_bytes,
+            preview=preview_rows,
+        )
+        STATE.db.add_task_message(
+            task_id,
+            role="assistant",
+            text=answer,
+            blocks={"tool_calls": [{
+                "name": "run_skill",
+                "arguments": {"skill_id": REPORT_LIST_SKILL_ID, "params": {"top_n": top_n}},
+                "is_error": False,
+            }], "task": {
+                "status": "done",
+                "excel_filename": result.excel.path.name,
+                "row_count": row_count,
+            }},
+        )
+        TASK_BUS.publish(task_id, {
+            "type": "assistant_message",
+            "text": answer,
+            "iterations": 1,
+        })
+        STATE.db.write_audit(
+            username=identity.username,
+            action="chat",
+            task_id=task_id,
+            question=req.message,
+            service=result.meta.get("service") if result.meta else REPORT_LIST_SERVICE,
+            odata_url=result.meta.get("odata_url") if result.meta else None,
+            row_count=row_count,
+            latency_ms=latency_ms,
+            llm_model="builtin/report-list",
+            llm_tokens=0,
+            ip=request.client.host if request.client else None,
+        )
+        return {
+            "task_id": task_id,
+            "answer": answer,
+            "iterations": 1,
+            "tool_calls": [{
+                "name": "run_skill",
+                "arguments": {"skill_id": REPORT_LIST_SKILL_ID, "params": {"top_n": top_n}},
+                "is_error": False,
+            }],
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "llm_model": "builtin/report-list",
+            "task": {
+                "status": "done",
+                "row_count": row_count,
+                "rows_preview": preview_rows,
+                "excel": {
+                    "filename": result.excel.path.name,
+                    "size_bytes": result.excel.size_bytes,
+                    "download_url": f"/api/tasks/{task_id}/file",
+                },
+            },
+        }
+
     resp = bw_client.execute_query(
         REPORT_LIST_SERVICE,
         REPORT_LIST_ENTITY_SET,
-        top=200,
+        top=top_n,
         count=True,
     )
     latency_ms = int((time.monotonic() - t0) * 1000)
@@ -209,7 +623,7 @@ def _run_report_list_shortcut(
             text=f"查询报告清单失败: {resp.error or f'HTTP {resp.status_code}'}",
             blocks={"tool_calls": [{
                 "name": "fetch_report_list",
-                "arguments": {"service": REPORT_LIST_SERVICE, "entity_set": REPORT_LIST_ENTITY_SET},
+                "arguments": {"service": REPORT_LIST_SERVICE, "entity_set": REPORT_LIST_ENTITY_SET, "top": top_n},
                 "is_error": True,
             }]},
         )
@@ -219,7 +633,7 @@ def _run_report_list_shortcut(
             "iterations": 1,
             "tool_calls": [{
                 "name": "fetch_report_list",
-                "arguments": {"service": REPORT_LIST_SERVICE, "entity_set": REPORT_LIST_ENTITY_SET},
+                "arguments": {"service": REPORT_LIST_SERVICE, "entity_set": REPORT_LIST_ENTITY_SET, "top": top_n},
                 "is_error": True,
             }],
             "input_tokens": 0,
@@ -236,7 +650,28 @@ def _run_report_list_shortcut(
     payload = resp.json or {}
     rows = payload.get("rows", [])
     row_count = int(payload.get("row_count_total") or payload.get("row_count_returned") or len(rows))
-    answer = f"已查询到报告清单，共 {row_count} 条，下面展示前 {min(len(rows), 50)} 条。"
+    columns = list(rows[0].keys()) if rows else ["ReportID", "ReportDescription"]
+    free_result = STATE.orchestrator.run_free_query(
+        service=REPORT_LIST_SERVICE,
+        entity_set=REPORT_LIST_ENTITY_SET,
+        columns=columns,
+        rows=rows,
+        info={
+            "question": req.message,
+            "service": REPORT_LIST_SERVICE,
+            "entity_set": REPORT_LIST_ENTITY_SET,
+            "odata_url": resp.url,
+            "row_count": row_count,
+            "latency_ms": latency_ms,
+        },
+        sheet_title="报告清单",
+        username=identity.username,
+    )
+    preview_rows = rows[:50]
+    answer = (
+        f"已查询到报告清单，共 {row_count} 条，"
+        f"已生成 Excel，下面展示前 {len(preview_rows)} 条。"
+    )
     STATE.db.finish_task(
         task_id,
         status="done",
@@ -247,17 +682,25 @@ def _run_report_list_shortcut(
         llm_input_tokens=0,
         llm_output_tokens=0,
     )
+    if free_result.excel:
+        STATE.db.add_task_file(
+            task_id,
+            filename=free_result.excel.path.name,
+            path=str(free_result.excel.path),
+            size_bytes=free_result.excel.size_bytes,
+            preview=preview_rows,
+        )
     STATE.db.add_task_message(
         task_id,
         role="assistant",
         text=answer,
         blocks={"tool_calls": [{
             "name": "fetch_report_list",
-            "arguments": {"service": REPORT_LIST_SERVICE, "entity_set": REPORT_LIST_ENTITY_SET},
+            "arguments": {"service": REPORT_LIST_SERVICE, "entity_set": REPORT_LIST_ENTITY_SET, "top": top_n},
             "is_error": False,
         }], "task": {
             "status": "done",
-            "excel_filename": None,
+            "excel_filename": free_result.excel.path.name if free_result.excel else None,
             "row_count": row_count,
         }},
     )
@@ -285,7 +728,7 @@ def _run_report_list_shortcut(
         "iterations": 1,
         "tool_calls": [{
             "name": "fetch_report_list",
-            "arguments": {"service": REPORT_LIST_SERVICE, "entity_set": REPORT_LIST_ENTITY_SET},
+            "arguments": {"service": REPORT_LIST_SERVICE, "entity_set": REPORT_LIST_ENTITY_SET, "top": top_n},
             "is_error": False,
         }],
         "input_tokens": 0,
@@ -294,8 +737,12 @@ def _run_report_list_shortcut(
         "task": {
             "status": "done",
             "row_count": row_count,
-            "rows_preview": rows[:50],
-            "excel": None,
+            "rows_preview": preview_rows,
+            "excel": ({
+                "filename": free_result.excel.path.name,
+                "size_bytes": free_result.excel.size_bytes,
+                "download_url": f"/api/tasks/{task_id}/file",
+            } if free_result.excel else None),
         },
     }
 
@@ -358,6 +805,7 @@ def auth_login(req: LoginRequest, response: Response, request: Request) -> dict[
     # 登录阶段不做 SAP 权限校验，仅创建本地会话并保存凭据；
     # 真实 OData 请求时再使用该凭据访问 SAP。
     username = (req.username or "").strip() or "demo"
+
     identity = Identity(
         username=username,
         display_name=username,
@@ -731,7 +1179,8 @@ def list_services_endpoint(
     q: str | None = None,
     identity: Identity = Depends(current_identity),
 ) -> dict[str, Any]:
-    resp = STATE.bw.list_services(search=q, top=100)
+    bw_client = _bw_client_for_identity(identity)
+    resp = bw_client.list_services(search=q, top=100)
     if resp.error:
         raise HTTPException(500, resp.error)
     return resp.json or {"services": [], "count": 0}
@@ -742,7 +1191,8 @@ def get_service_endpoint(
     service: str,
     identity: Identity = Depends(current_identity),
 ) -> dict[str, Any]:
-    resp = STATE.bw.get_metadata(service)
+    bw_client = _bw_client_for_identity(identity)
+    resp = bw_client.get_metadata(service)
     if resp.error:
         raise HTTPException(resp.status_code or 500, resp.error)
     return resp.json or {}

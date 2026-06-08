@@ -269,8 +269,18 @@ def test_report_list_shortcut_works_without_llm(logged_in: httpx.Client):
     assert body["llm_model"] == "builtin/report-list"
     assert body["task"]["status"] == "done"
     assert body["task"]["row_count"] >= 1
+    assert body["task"]["excel"] is not None
+    assert body["task"]["excel"]["download_url"].startswith("/api/tasks/")
     first = body["task"]["rows_preview"][0]
     assert {"ReportID", "ReportDescription"}.issubset(first.keys())
+
+
+def test_report_list_shortcut_respects_top_n(logged_in: httpx.Client):
+    r = logged_in.post("/api/chat", json={"message": "报告清单前1条"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["task"]["status"] == "done"
+    assert len(body["task"]["rows_preview"]) == 1
 
 
 def test_spa_fallback(client: httpx.Client):

@@ -1,0 +1,14 @@
+service: ZBW_QUERY_LIST_SRV
+entity_set: LtResultSet
+
+filter_template: ""
+
+select:
+  - ReportID
+  - ReportDescription
+
+orderby: ReportID asc
+
+top: "{{ top_n | default(200) }}"
+
+sheet_title: 报告清单

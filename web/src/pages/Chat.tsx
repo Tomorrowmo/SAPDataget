@@ -15,7 +15,7 @@ interface Turn {
 }
 
 export default function Chat() {
-  const { status } = useAuth();
+  const { status, identity } = useAuth();
   const { task_id: routeTaskId } = useParams();
   const navigate = useNavigate();
   const [input, setInput] = useState("");
@@ -40,16 +40,14 @@ export default function Chat() {
     })();
   }, [routeTaskId]);
 
-  const send = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || busy) return;
-    const msg = input.trim();
+  const submitMessage = async (msg: string) => {
+    if (!msg.trim() || busy) return;
+    const normalized = msg.trim();
     setInput("");
     setBusy(true);
-    setTurns((ts) => [...ts, { user: msg, pending: true }]);
+    setTurns((ts) => [...ts, { user: normalized, pending: true }]);
     try {
-      const r = await api.chat(msg, activeTask || undefined);
-      // 首次回复 → 把 url 切到 /chat/:task_id (沉淀对话)
+      const r = await api.chat(normalized, activeTask || undefined);
       if (!activeTask && r.task_id) {
         setActiveTask(r.task_id);
         navigate(`/chat/${r.task_id}`, { replace: true });
@@ -69,10 +67,32 @@ export default function Chat() {
     }
   };
 
+  const send = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await submitMessage(input);
+  };
+
   const reset = () => {
     setTurns([]);
     setActiveTask(null);
     navigate("/chat");
+  };
+
+  const filterRowsByLoginUser = (rows: Record<string, unknown>[]) => {
+    if (!rows.length || !identity?.username) return rows;
+    const unameKey = Object.keys(rows[0]).find((k) => k.toLowerCase() === "uname");
+    if (!unameKey) return rows;
+    const normalizeUser = (value: unknown) =>
+      String(value ?? "")
+        .toUpperCase()
+        .replace(/\s+/g, "")
+        .trim();
+
+    const loginName = normalizeUser(identity.username);
+    return rows.filter((row) => {
+      const current = normalizeUser(row[unameKey]);
+      return current === loginName;
+    });
   };
 
   return (
@@ -111,6 +131,25 @@ export default function Chat() {
           仍可直接输入“报告清单”“报告列表”等关键字,系统会走内置 OData 查询。
         </div>
       )}
+
+      <div className="mb-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={() => { void submitMessage("报告清单"); }}
+          disabled={busy}
+          className="px-3 py-1.5 text-sm rounded-md border border-zinc-300 bg-white hover:bg-zinc-50 text-zinc-700 disabled:opacity-50"
+        >
+          快速查询: 报告清单
+        </button>
+        <button
+          type="button"
+          onClick={() => { void submitMessage("报告清单前100条"); }}
+          disabled={busy}
+          className="px-3 py-1.5 text-sm rounded-md border border-zinc-300 bg-white hover:bg-zinc-50 text-zinc-700 disabled:opacity-50"
+        >
+          快速查询: 报告清单前100条
+        </button>
+      </div>
 
       {/* 对话区 */}
       <div className="flex-1 overflow-y-auto space-y-4 pb-4">
@@ -197,10 +236,10 @@ export default function Chat() {
                 {t.resp.task?.rows_preview && t.resp.task.rows_preview.length > 0 && (
                   <details className="mt-3">
                     <summary className="cursor-pointer text-xs text-zinc-500">
-                      📊 数据预览 ({t.resp.task.row_count} 行)
+                      📊 数据预览 (仅显示当前登录账号 UName，预览 {filterRowsByLoginUser(t.resp.task.rows_preview).length} 行)
                     </summary>
                     <div className="mt-2">
-                      <DataTable rows={t.resp.task.rows_preview} maxRows={20} />
+                      <DataTable rows={filterRowsByLoginUser(t.resp.task.rows_preview)} maxRows={20} />
                     </div>
                   </details>
                 )}
