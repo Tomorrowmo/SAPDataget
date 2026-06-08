@@ -63,6 +63,7 @@ from app.db import DB
 from app.llm import LLMClient, KNOWN_MODELS, find_model, model_ready
 from app.orchestrator import TaskOrchestrator
 from app.query_limits import parse_requested_top
+from app.rowsec import scope_rows_to_user
 from app.skills.registry import SkillRegistry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -409,10 +410,20 @@ def _run_report_list_shortcut(
                 },
             }
 
-        # P2-4: 用解析到的 top_n 截断(与 mock 路径一致),而非硬编码 5 条。
-        rows = rows_all[:top_n]
-        row_count_total = total_count if total_count is not None else len(rows_all)
-        columns = list(rows[0].keys()) if rows else ["ReportID", "ReportDescription"]
+        # 该服务一次返回全部(实测 8506 行,无分页、无 <m:count>)。关键修复:**先按登录用户
+        # 过滤全量(归属字段 Uname),再 top_n 截断** —— 否则先切前 top_n(默认 200)再过滤,
+        # 用户的报告若不在前 200 里就会显示 0(生产复现的"8506/200/0"正因顺序反了)。
+        user_rows, owner_applied = scope_rows_to_user(
+            rows_all, STATE.settings.owner_field, identity.username,
+        )
+        base_rows = user_rows if owner_applied else rows_all
+        rows = base_rows[:top_n]
+        # 归属过滤后,“总数”用你名下的真实条数;否则用 <m:count> 或全量长度。
+        if owner_applied:
+            row_count_total = len(base_rows)
+        else:
+            row_count_total = total_count if total_count is not None else len(rows_all)
+        columns = list(rows[0].keys()) if rows else ["Uname", "Compid", "Txtlg"]
         free_result = STATE.orchestrator.run_free_query(
             service=REPORT_LIST_SERVICE,
             entity_set=REPORT_LIST_ENTITY_SET,
@@ -426,14 +437,15 @@ def _run_report_list_shortcut(
                 "row_count": len(rows),
                 "row_count_total": row_count_total,
                 "latency_ms": latency_ms,
+                "owner_scoped": owner_applied,
             },
             sheet_title="报告清单",
             username=identity.username,
         )
-        # free_result.row_count 已是归属过滤后的实数(若该服务含 UName)。
+        scope_note = f"（你 {identity.username} 名下）" if owner_applied else ""
         answer = (
-            f"固定 OData 链接解析完成，共 {row_count_total} 条，"
-            f"现返回其中 {free_result.row_count} 条，并已生成 Excel。"
+            f"报告清单解析完成，共 {row_count_total} 条{scope_note}，"
+            f"现返回其中 {len(rows)} 条，并已生成 Excel。"
         )
         STATE.db.finish_task(
             task_id,
