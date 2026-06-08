@@ -55,3 +55,6 @@ web/.vite/
 *.swp
 .DS_Store
 Thumbs.db
+
+# SAP 探针生成的报告(含真实数据,勿提交)
+tools/sap_probe_report.md

@@ -42,6 +42,20 @@ export default function Chat() {
   const abortRef = useRef<AbortController | null>(null);
   const skipLoadRef = useRef<string | null>(null);   // 自己刚导航到的 task,别重复拉历史
   const [sessionsRefresh, setSessionsRefresh] = useState(0);  // 触发会话侧栏刷新
+  const scrollRef = useRef<HTMLDivElement>(null);    // 对话滚动容器
+  const stickRef = useRef(true);                     // 是否"贴底跟随"(用户上翻看历史时关闭)
+
+  // 内容增长(发问/流式)时,若用户当前贴着底部,就自动滚到底跟随。
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+  }, [turns]);
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+  };
 
   const llmReady = status?.llm.current_ready ?? false;
   const reportListHint = /报告(清单|列表)|报表(清单|列表)|report\s*list|query\s*list/i.test(input);
@@ -223,7 +237,7 @@ export default function Chat() {
         </div>
 
         {/* 对话气泡 */}
-        <div className="flex-1 overflow-y-auto space-y-4 pb-4">
+        <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto space-y-4 pb-4">
           {turns.length === 0 && (
             <div className="bg-white rounded-lg border border-zinc-200 p-6">
               <div className="text-sm text-zinc-500 mb-3">💡 试试这些提问:</div>
