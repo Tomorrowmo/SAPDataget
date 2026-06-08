@@ -35,14 +35,22 @@ class SkillRunner:
         normalized = _validate_and_normalize(skill, params)
 
         # 2. 渲染 filter / top
+        #    关键安全点(P0-2):filter_template 形如 Region eq '{{ region }}',渲染前对
+        #    字符串参数值做 OData 单引号转义(' → ''),既修复带撇号的正常值(O'Brien)崩溃,
+        #    又中和 OData 注入(region="HD' or '1'='1" → 被收进单个字面量)。数值参数无引号,
+        #    转义对其为 no-op。注意:仅渲染上下文转义,SkillRunResult.params 仍保留原值。
+        render_ctx = {
+            k: (v.replace("'", "''") if isinstance(v, str) else v)
+            for k, v in normalized.items()
+        }
         try:
             rendered_filter = (
-                _jinja_env.from_string(skill.filter_template).render(**normalized)
+                _jinja_env.from_string(skill.filter_template).render(**render_ctx)
                 if skill.filter_template else ""
             )
             top_value = skill.top
             if isinstance(top_value, str):
-                top_value = _jinja_env.from_string(top_value).render(**normalized)
+                top_value = _jinja_env.from_string(top_value).render(**render_ctx)
             rendered_top = int(top_value) if top_value else 100
         except Exception as e:
             return SkillRunResult(

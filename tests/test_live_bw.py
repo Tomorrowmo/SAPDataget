@@ -75,6 +75,8 @@ def _settings() -> BWSettings:
         language="EN",
         verify_ssl=True,
         timeout=30,
+        client_fallback=True,
+        max_export_rows=50000,
     )
 
 

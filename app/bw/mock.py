@@ -200,7 +200,9 @@ class MockBWClient(BWClient):
         except Exception as e:  # 兜底，转成业务错误而非崩溃
             return ODataResponse(500, url, error=f"查询执行失败: {e}")
 
-        rows = _df_to_rows(df.head(200))  # 防爆: 最多 200 行进 LLM
+        # 返回 $top 截断后的全部行(不再额外硬截断到 200)。"喂 LLM 只取少量样本"
+        # 是调用方(Agent)的职责,不应在数据源层写死 —— 否则导出 Excel 也会被连带截断。
+        rows = _df_to_rows(df)
         payload: dict[str, Any] = {
             "rows": rows,
             "row_count_returned": len(rows),

@@ -290,6 +290,8 @@ def _bw_client_for_identity(identity: Identity):
         language=STATE.settings.bw.language,
         verify_ssl=STATE.settings.bw.verify_ssl,
         timeout=STATE.settings.bw.timeout,
+        client_fallback=STATE.settings.bw.client_fallback,
+        max_export_rows=STATE.settings.bw.max_export_rows,
     )
     return LiveBWClient(settings)
 
@@ -407,7 +409,8 @@ def _run_report_list_shortcut(
                 },
             }
 
-        rows = rows_all[:5]
+        # P2-4: 用解析到的 top_n 截断(与 mock 路径一致),而非硬编码 5 条。
+        rows = rows_all[:top_n]
         row_count_total = total_count if total_count is not None else len(rows_all)
         columns = list(rows[0].keys()) if rows else ["ReportID", "ReportDescription"]
         free_result = STATE.orchestrator.run_free_query(
@@ -429,7 +432,7 @@ def _run_report_list_shortcut(
         )
         answer = (
             f"固定 OData 链接解析完成，共 {row_count_total} 条，"
-            f"现返回其中 5 条，并已生成 Excel。"
+            f"现返回其中 {len(rows)} 条，并已生成 Excel。"
         )
         STATE.db.finish_task(
             task_id,
@@ -1476,6 +1479,7 @@ async def chat_stream_endpoint(
                 skills=STATE.skills, orchestrator=STATE.orchestrator,
                 username=identity.username, role=identity.role,
                 on_excel=_register_excel_cb(task_id),
+                sensitive_resolver=STATE.orchestrator._resolve_sensitive,  # 样本喂 LLM 前脱敏(P1-3)
             )
             try:
                 async for step in agent.run_turn(req.message, history=history_text):

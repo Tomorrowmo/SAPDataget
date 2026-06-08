@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -16,11 +17,15 @@ import requests
 import urllib3
 from requests.auth import HTTPBasicAuth
 
+from app import odata
 from app.bw.interface import BWClient, ODataResponse
 from app.config import BWSettings
 
+log = logging.getLogger(__name__)
+
 CATALOG_PATH = "/sap/opu/odata/iwfnd/CATALOGSERVICE;v=2/ServiceCollection"
 ODATA_SERVICE_ROOT = "/sap/opu/odata/sap"
+_MAX_PAGES = 200                 # 分页跟随 __next 的硬上限(配合 settings.max_export_rows)
 
 
 class LiveBWClient(BWClient):
@@ -37,6 +42,8 @@ class LiveBWClient(BWClient):
         if not settings.verify_ssl:
             self.session.verify = False
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        # $metadata 简化结果缓存(key=service),供列 label + Edm 类型转换复用,避免每查询重拉。
+        self._meta_cache: dict[str, dict[str, Any]] = {}
 
     # ---------- 基础请求 ----------
     def _default_params(self) -> dict[str, str]:
@@ -66,8 +73,19 @@ class LiveBWClient(BWClient):
             headers=headers,
             timeout=self.settings.timeout,
         )
-        # 某些系统不需要/不接受 sap-client,失败时自动回退为不带 client 再试一次。
-        if "sap-client" in merged and resp.status_code in (401, 403, 404):
+        # 某些系统不接受显式 sap-client → 仅在 401/403(鉴权类)时回退一次为不带 client。
+        # 不再对 404 回退(404 是资源不存在,与 client 无关);回退会落到 Gateway 默认
+        # client,可能读到另一个 client 的数据,因此必须留痕,且可用 BW_CLIENT_FALLBACK 关闭。
+        if (
+            self.settings.client_fallback
+            and "sap-client" in merged
+            and resp.status_code in (401, 403)
+        ):
+            log.warning(
+                "sap-client=%s 在 %s 上返回 %s,回退为不带 sap-client 重试一次"
+                "(可能落到 Gateway 默认 client,请确认数据归属)。",
+                merged.get("sap-client"), url, resp.status_code,
+            )
             fallback_params = {k: v for k, v in merged.items() if k != "sap-client"}
             return self.session.get(
                 url,
@@ -76,6 +94,12 @@ class LiveBWClient(BWClient):
                 timeout=self.settings.timeout,
             )
         return resp
+
+    def _get_url(self, url: str) -> requests.Response:
+        """裸 GET 一个完整 URL(用于跟随 OData __next 分页链接)。__next 已自带 query
+        与 sap-client 上下文,这里不再叠加默认参数,避免重复 sap-client。"""
+        full = url if url.startswith("http") else self.settings.base_url + url
+        return self.session.get(full, timeout=self.settings.timeout)
 
     # ---------- BWClient 接口实现 ----------
     def describe(self) -> str:
@@ -119,7 +143,11 @@ class LiveBWClient(BWClient):
         )
 
     def get_metadata(self, service: str) -> ODataResponse:
-        path = f"{ODATA_SERVICE_ROOT}/{service.strip('/')}/$metadata"
+        key = service.strip("/")
+        if key in self._meta_cache:
+            url = f"{self.settings.base_url}{ODATA_SERVICE_ROOT}/{key}/$metadata"
+            return ODataResponse(200, url, json=self._meta_cache[key])
+        path = f"{ODATA_SERVICE_ROOT}/{key}/$metadata"
         try:
             r = self._get(path, accept_json=False)
         except requests.RequestException as e:
@@ -128,7 +156,7 @@ class LiveBWClient(BWClient):
             return ODataResponse(
                 r.status_code, r.url,
                 text=r.text[:2000],
-                error=f"HTTP {r.status_code}",
+                error=odata.parse_odata_error(r.text, r.headers.get("content-type", "")) or f"HTTP {r.status_code}",
             )
         try:
             simplified = _parse_metadata(r.text)
@@ -138,7 +166,17 @@ class LiveBWClient(BWClient):
                 text=r.text[:2000],
                 error=f"$metadata 解析失败: {e}",
             )
+        self._meta_cache[key] = simplified
         return ODataResponse(r.status_code, r.url, json=simplified)
+
+    def _cached_metadata(self, service: str) -> dict[str, Any]:
+        """取简化 metadata(命中缓存直接用;未命中懒拉一次)。失败返回 {}。"""
+        key = service.strip("/")
+        if key not in self._meta_cache:
+            resp = self.get_metadata(key)
+            if resp.error or not isinstance(resp.json, dict):
+                return {}
+        return self._meta_cache.get(key, {})
 
     def execute_query(
         self,
@@ -178,60 +216,86 @@ class LiveBWClient(BWClient):
         except requests.RequestException as e:
             return ODataResponse(0, path, error=f"请求异常: {e}")
 
+        first_url = r.url
+        if not r.ok:
+            # 解析 SAP 结构化错误体(error.message.value / <error><message>),让 Agent 能精准自纠。
+            msg = odata.parse_odata_error(r.text, r.headers.get("content-type", "")) or f"HTTP {r.status_code}"
+            return ODataResponse(r.status_code, first_url, text=r.text[:2000], error=msg)
+
+        parsed = self._parse_page(r)
+        if parsed is None:
+            return ODataResponse(r.status_code, first_url, text=r.text[:2000],
+                                 error="无法解析响应(非 OData V2 JSON/Atom)")
+        rows, total, next_url = parsed
+
+        # 跟随 __next 分页,直到取满目标行数(top)或到达安全上限。target=None 表示不限(由
+        # max_export_rows 兜底)。这修复了"导出全部却只拿一页/被截断"的问题。
+        target = top if top is not None else self.settings.max_export_rows
+        target = min(target, self.settings.max_export_rows)
+        pages = 1
+        while next_url and len(rows) < target and pages < _MAX_PAGES:
+            try:
+                rn = self._get_url(next_url)
+            except requests.RequestException:
+                break
+            if not rn.ok:
+                break
+            pnext = self._parse_page(rn)
+            if pnext is None:
+                break
+            more, total_n, next_url = pnext
+            if total is None:
+                total = total_n
+            rows.extend(more)
+            pages += 1
+        rows = rows[:target]
+
+        # Edm 类型转换:把 Decimal 字符串/`/Date(ms)/` 等转真实类型,下游 Excel/统计/图表才正确。
+        types = odata.prop_types(self._cached_metadata(service), entity_set.strip("/"))
+        rows = odata.coerce_rows(rows, types)
+
+        return ODataResponse(
+            r.status_code, first_url,
+            json={
+                "rows": rows,
+                "row_count_returned": len(rows),
+                "row_count_total": total,
+            },
+        )
+
+    # ---------- 单页解析(V2 d.results / V4 value / Atom XML) ----------
+    def _parse_page(self, r: requests.Response) -> tuple[list[dict[str, Any]], Any, str | None] | None:
+        """解析一页响应为 (rows, total, next_url)。无法解析返回 None。
+
+        rows 已剥除 __metadata 噪声,但**不截断**(分页/导出需要完整)。
+        next_url 来自 V2 ``d.__next`` 或 V4 ``@odata.nextLink`` 或 Atom ``<link rel=next>``。
+        """
         body: Any = None
         try:
             body = r.json()
         except ValueError:
-            pass
+            body = None
 
-        if isinstance(body, dict) and "d" in body:
+        if isinstance(body, dict) and "d" in body:                    # OData V2 JSON
             d = body["d"]
             if isinstance(d, dict) and "results" in d:
-                rows = d.get("results", [])
-                payload = {
-                    "rows": _strip_metadata(rows[:200]),
-                    "row_count_returned": len(rows),
-                    "row_count_total": d.get("__count"),
-                }
-                return ODataResponse(
-                    r.status_code, r.url,
-                    json=payload,
-                    error=None if r.ok else f"HTTP {r.status_code}",
-                )
-            return ODataResponse(
-                r.status_code, r.url,
-                json={"value": _strip_metadata(d)},
-                error=None if r.ok else f"HTTP {r.status_code}",
-            )
+                rows = _strip_metadata(d.get("results", []) or [])
+                return rows, d.get("__count"), d.get("__next")
+            return _strip_metadata(d if isinstance(d, list) else [d]), None, None
 
-        if isinstance(body, dict) and isinstance(body.get("value"), list):
-            rows = body.get("value", [])
-            payload = {
-                "rows": _strip_metadata(rows[:200]),
-                "row_count_returned": len(rows),
-                "row_count_total": body.get("@odata.count") or body.get("count"),
-            }
-            return ODataResponse(
-                r.status_code,
-                r.url,
-                json=payload,
-                error=None if r.ok else f"HTTP {r.status_code}",
-            )
+        if isinstance(body, dict) and isinstance(body.get("value"), list):  # OData V4 JSON
+            rows = _strip_metadata(body.get("value", []) or [])
+            total = body.get("@odata.count") or body.get("count")
+            return rows, total, body.get("@odata.nextLink")
 
-        parsed_xml = _parse_odata_xml_rows(r.text)
+        parsed_xml = _parse_odata_xml_rows(r.text)                    # Atom/XML
         if parsed_xml is not None:
-            return ODataResponse(
-                r.status_code,
-                r.url,
-                json=parsed_xml,
-                error=None if r.ok else f"HTTP {r.status_code}",
+            return (
+                parsed_xml.get("rows", []),
+                parsed_xml.get("row_count_total"),
+                parsed_xml.get("next_url"),
             )
-
-        return ODataResponse(
-            r.status_code, r.url,
-            text=r.text[:2000],
-            error=None if r.ok else f"HTTP {r.status_code}",
-        )
+        return None
 
 
 # ============================== EDMX 解析 ==============================
@@ -341,11 +405,14 @@ def _parse_odata_xml_rows(xml_text: str) -> dict[str, Any] | None:
 
     rows: list[dict[str, Any]] = []
     row_count_total: str | None = None
+    next_url: str | None = None
 
     for node in root.iter():
         local = _local(node.tag)
         if local == "count" and row_count_total is None:
             row_count_total = (node.text or "").strip() or None
+        if local == "link" and node.attrib.get("rel") == "next" and not next_url:
+            next_url = node.attrib.get("href") or None
         if local != "entry":
             continue
         props = None
@@ -388,7 +455,8 @@ def _parse_odata_xml_rows(xml_text: str) -> dict[str, Any] | None:
         return None
 
     return {
-        "rows": rows[:200],
+        "rows": rows,                 # 不截断:分页/导出需要完整行
         "row_count_returned": len(rows),
         "row_count_total": row_count_total,
+        "next_url": next_url,
     }

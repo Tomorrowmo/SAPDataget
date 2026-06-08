@@ -54,6 +54,8 @@ class BWSettings:
     language: str
     verify_ssl: bool
     timeout: int
+    client_fallback: bool       # 401/403 时是否去掉 sap-client 重试一次(默认 True;留痕)
+    max_export_rows: int        # 单次导出最多分页拉取的行数上限(防失控)
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,8 @@ def load_settings() -> Settings:
         language=_get("BW_LANGUAGE", "EN") or "EN",
         verify_ssl=_get_bool("BW_VERIFY_SSL", True),
         timeout=_get_int("BW_TIMEOUT", 60),
+        client_fallback=_get_bool("BW_CLIENT_FALLBACK", True),
+        max_export_rows=_get_int("BW_MAX_EXPORT_ROWS", 50000),
     )
 
     return Settings(

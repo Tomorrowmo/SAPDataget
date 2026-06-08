@@ -71,6 +71,8 @@ def verify_bw_credentials(bw_settings: BWSettings, username: str, password: str)
         language=bw_settings.language,
         verify_ssl=bw_settings.verify_ssl,
         timeout=bw_settings.timeout,
+        client_fallback=bw_settings.client_fallback,
+        max_export_rows=bw_settings.max_export_rows,
     )
     client = LiveBWClient(cloned)
     resp = client.list_services(top=1)

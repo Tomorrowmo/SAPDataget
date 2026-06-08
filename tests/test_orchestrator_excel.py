@@ -22,6 +22,7 @@ def settings(tmp_path: Path, mock_data_dir: Path) -> Settings:
             mock_latency_ms=0,
             base_url="", username="", password="", client="",
             language="EN", verify_ssl=True, timeout=60,
+            client_fallback=True, max_export_rows=50000,
         ),
         output_dir=tmp_path / "outputs",
         skills_dir=Path(__file__).resolve().parent.parent / "data" / "skills",
