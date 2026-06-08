@@ -7,6 +7,7 @@ import type { AgentEvent, ChatTaskPayload, TaskMessage } from "../types";
 import DataTable from "../components/DataTable";
 import ExcelCard from "../components/ExcelCard";
 import WorkbenchPanel from "../components/WorkbenchPanel";
+import ChatSessions from "../components/ChatSessions";
 import { useAuth } from "../auth";
 
 interface Turn {
@@ -40,6 +41,7 @@ export default function Chat() {
   const [activeTask, setActiveTask] = useState<string | null>(routeTaskId || null);
   const abortRef = useRef<AbortController | null>(null);
   const skipLoadRef = useRef<string | null>(null);   // 自己刚导航到的 task,别重复拉历史
+  const [sessionsRefresh, setSessionsRefresh] = useState(0);  // 触发会话侧栏刷新
 
   const llmReady = status?.llm.current_ready ?? false;
   const reportListHint = /报告(清单|列表)|报表(清单|列表)|report\s*list|query\s*list/i.test(input);
@@ -83,11 +85,12 @@ export default function Chat() {
         (ev) => handleEvent(ev),
         ac.signal,
       );
-      // 流式完成后,首轮把 URL 切到 /chat/:id(可分享);跳过随后的历史重载。
+      // 流式完成后,首轮把 URL 切到 /chat/:id(可分享);跳过随后的历史重载;刷新会话侧栏。
       if (task_id && task_id !== activeTask) {
         setActiveTask(task_id);
         skipLoadRef.current = task_id;
         if (!routeTaskId) navigate(`/chat/${task_id}`, { replace: true });
+        setSessionsRefresh((n) => n + 1);
       }
       patchLast((t) => ({ ...t, pending: false }));
     } catch (e) {
@@ -162,7 +165,15 @@ export default function Chat() {
 
   return (
     <div className="flex gap-4 h-full">
-      {/* 左:对话区 */}
+      {/* 最左:会话历史侧栏(抄 DataAgent) */}
+      <ChatSessions
+        activeId={activeTask}
+        onSelect={(id) => { skipLoadRef.current = null; navigate(`/chat/${id}`); }}
+        onNew={reset}
+        refreshKey={sessionsRefresh}
+      />
+
+      {/* 中:对话区 */}
       <div className="flex-1 min-w-0 flex flex-col max-w-4xl">
         <div className="flex items-center justify-between mb-4">
           <div>

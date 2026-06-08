@@ -430,9 +430,10 @@ def _run_report_list_shortcut(
             sheet_title="报告清单",
             username=identity.username,
         )
+        # free_result.row_count 已是归属过滤后的实数(若该服务含 UName)。
         answer = (
             f"固定 OData 链接解析完成，共 {row_count_total} 条，"
-            f"现返回其中 {len(rows)} 条，并已生成 Excel。"
+            f"现返回其中 {free_result.row_count} 条，并已生成 Excel。"
         )
         STATE.db.finish_task(
             task_id,
@@ -1558,6 +1559,56 @@ async def chat_stream_endpoint(
                     log.exception("流式收尾落 assistant 消息失败 task=%s", task_id)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+# ============================== /api/chat/sessions (会话历史) ==============================
+
+def _session_title(row: dict[str, Any]) -> str:
+    """会话标题:显式 title 优先,否则用首条问题截断,再否则占位。"""
+    t = (row.get("title") or "").strip()
+    if t:
+        return t
+    q = (row.get("question") or "").strip()
+    if q:
+        return q[:40] + ("…" if len(q) > 40 else "")
+    return "新对话"
+
+
+@app.get("/api/chat/sessions")
+def list_chat_sessions_endpoint(
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    """当前用户的自由对话会话列表(抄 DataAgent 会话侧栏的数据源)。"""
+    rows = STATE.db.list_chat_sessions(identity.username, limit=100)
+    sessions = [{
+        "id": r["id"],
+        "title": _session_title(r),
+        "status": r.get("status"),
+        "created_at": r.get("created_at"),
+        "finished_at": r.get("finished_at"),
+    } for r in rows]
+    return {"sessions": sessions, "total": len(sessions)}
+
+
+class SessionTitleRequest(BaseModel):
+    title: str
+
+
+@app.patch("/api/chat/sessions/{task_id}")
+def rename_chat_session(
+    task_id: str,
+    req: SessionTitleRequest,
+    identity: Identity = Depends(current_identity),
+) -> dict[str, Any]:
+    """重命名会话(仅本人)。"""
+    row = STATE.db.get_task(task_id)
+    if not row or row.get("username") != identity.username or row.get("source") != "chat":
+        raise HTTPException(404, "会话不存在")
+    title = (req.title or "").strip()
+    if not title:
+        raise HTTPException(400, "标题不能为空")
+    STATE.db.set_task_title(task_id, title[:120])
+    return {"ok": True, "id": task_id, "title": title[:120]}
 
 
 # ============================== /api/tasks ==============================

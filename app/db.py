@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   llm_output_tokens   INTEGER,
   created_at          TEXT DEFAULT (datetime('now')),
   finished_at         TEXT,
-  parent_task_id      TEXT
+  parent_task_id      TEXT,
+  title               TEXT                       -- 会话标题(可重命名;空则用首条问题)
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_user_time ON tasks(username, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_skill ON tasks(skill_id);
@@ -185,6 +186,10 @@ class DB:
                 if "username" not in cols:
                     conn.execute("DROP TABLE llm_api_keys")
             conn.executescript(SCHEMA)
+            # 迁移:老库的 tasks 补 title 列(会话重命名用;CREATE IF NOT EXISTS 不会自动加列)。
+            tcols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+            if tcols and "title" not in tcols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN title TEXT")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -272,6 +277,21 @@ class DB:
                 (username, limit),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def list_chat_sessions(self, username: str, limit: int = 100) -> list[dict[str, Any]]:
+        """列出用户的"自由对话"会话(每个 chat task 一行,不连 task_files,避免重复)。"""
+        with self.cursor() as cur:
+            rows = cur.execute(
+                "SELECT id, title, question, status, created_at, finished_at "
+                "FROM tasks WHERE username=? AND source='chat' "
+                "ORDER BY created_at DESC LIMIT ?",
+                (username, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def set_task_title(self, task_id: str, title: str) -> None:
+        with self.cursor() as cur:
+            cur.execute("UPDATE tasks SET title=? WHERE id=?", (title, task_id))
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         with self.cursor() as cur:

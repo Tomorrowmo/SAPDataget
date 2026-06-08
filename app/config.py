@@ -64,6 +64,7 @@ class Settings:
     bw: BWSettings
     output_dir: Path
     skills_dir: Path
+    owner_field: str            # 行级归属字段(默认 UName):结果含此列则只返回登录用户名下的行
 
     def validate(self) -> list[str]:
         """启动期自检；返回错误列表（空 = OK）。"""
@@ -112,4 +113,5 @@ def load_settings() -> Settings:
         bw=bw,
         output_dir=Path(_get("OUTPUT_DIR", "./data/outputs")).resolve(),
         skills_dir=Path(_get("SKILLS_DIR", "./data/skills")).resolve(),
+        owner_field=_get("OWNER_FIELD", "UName"),
     )

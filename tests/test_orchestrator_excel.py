@@ -26,6 +26,7 @@ def settings(tmp_path: Path, mock_data_dir: Path) -> Settings:
         ),
         output_dir=tmp_path / "outputs",
         skills_dir=Path(__file__).resolve().parent.parent / "data" / "skills",
+        owner_field="UName",
     )
 
 
@@ -68,6 +69,31 @@ def test_run_skill_produces_excel(orch: TaskOrchestrator, tmp_path: Path):
     assert info_dict.get("username") == "alice"
     assert info_dict.get("skill_id") == "monthly_sales_region"
     assert info_dict.get("bw_mode") == "mock"
+
+
+def test_run_free_query_scopes_rows_by_owner(orch: TaskOrchestrator):
+    """run_free_query:结果含 UName 时只保留登录用户名下的行(Excel + 预览 + 计数)。"""
+    rows = [
+        {"UName": "ADMIN", "Val": 1},
+        {"UName": "BOB", "Val": 2},
+        {"UName": "admin", "Val": 3},   # 大小写归一化后仍属 admin
+    ]
+    res = orch.run_free_query(
+        service="ZX_SRV", entity_set="Items", columns=["UName", "Val"],
+        rows=rows, info={"row_count": 3}, username="admin",
+    )
+    assert res.status == "done"
+    assert res.row_count == 2, "应只含 admin 的 2 行"
+    assert {r["Val"] for r in res.rows_preview} == {1, 3}
+    assert res.meta.get("owner_scoped") is True
+
+    # 不含 UName 的结果不受影响(no-op)
+    res2 = orch.run_free_query(
+        service="ZX_SRV", entity_set="Items", columns=["Region", "Val"],
+        rows=[{"Region": "HD", "Val": 9}], info={"row_count": 1}, username="admin",
+    )
+    assert res2.row_count == 1
+    assert res2.meta.get("owner_scoped") is not True
 
 
 def test_run_skill_unknown_id(orch: TaskOrchestrator):

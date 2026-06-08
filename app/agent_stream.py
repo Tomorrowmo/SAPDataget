@@ -36,6 +36,7 @@ from app import odata
 from app.bw.interface import BWClient
 from app.config import Settings
 from app.excel.builder import apply_sensitive_mask
+from app.rowsec import scope_rows_to_user
 from app.llm import LLMClient
 from app.orchestrator import TaskOrchestrator, TaskResult
 from app.skills.registry import SkillRegistry
@@ -490,7 +491,10 @@ class StreamAgent:
                     apply=args.get("apply"), count=True,
                 )
                 if not resp.error and resp.json:
-                    rows = (resp.json.get("rows") or [])[:_LLM_SAMPLE_ROWS]
+                    rows = resp.json.get("rows") or []
+                    # 行级归属过滤:只让 LLM 看到登录用户名下的样本(与导出 Excel 口径一致)。
+                    rows, _scoped = scope_rows_to_user(rows, self.settings.owner_field, self.username)
+                    rows = rows[:_LLM_SAMPLE_ROWS]
                     rows = self._mask_sample(args["service"], rows)   # P1-3 脱敏后才喂 LLM
                     return {
                         "status": "ok",

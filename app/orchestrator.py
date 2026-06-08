@@ -20,6 +20,7 @@ from typing import Any
 from app.bw.interface import BWClient
 from app.config import Settings
 from app.excel.builder import ExcelBuilder, ExcelResult, load_chart_config
+from app.rowsec import scope_rows_to_user
 from app.skills.registry import SkillRegistry
 from app.skills.runner import SkillRunner
 from app.skills.schema import Skill
@@ -104,10 +105,21 @@ class TaskOrchestrator:
                 meta={"odata_url": result.response.url, "params": result.params},
             )
 
+        # 行级归属过滤:结果含归属字段(UName)则只保留登录用户名下的行(Excel + 预览都裁)。
+        rows, scoped = scope_rows_to_user(rows, self.settings.owner_field, username)
+        if scoped and not rows:
+            return TaskResult(
+                task_id=task_id, status="failed",
+                error=f"查询结果中没有属于你（{username}）的数据。",
+                meta={"odata_url": result.response.url, "params": result.params},
+            )
+
         # 构造 Excel
         columns = skill.select if skill.select else list(rows[0].keys())
         labels = _column_labels(skill, self.bw)
         latency_ms = int((time.monotonic() - t0) * 1000)
+        # 归属过滤后,行数用裁剪后的实数(总数=全用户总数会误导)。
+        row_count = len(rows) if scoped else (data.get("row_count_total") or len(rows))
         info = {
             "username": username,
             "question": question or f"[skill] {skill.title}",
@@ -116,10 +128,11 @@ class TaskOrchestrator:
             "service": skill.service,
             "entity_set": skill.entity_set,
             "odata_url": result.response.url,
-            "row_count": data.get("row_count_total") or len(rows),
+            "row_count": row_count,
             "latency_ms": latency_ms,
             "bw_mode": self.settings.bw.mode,
             "rendered_filter": result.rendered_filter,
+            "owner_scoped": scoped,
         }
         filename = _filename(skill.id, username)
         template_path = None
@@ -164,12 +177,18 @@ class TaskOrchestrator:
         """LLM 已经在自由模式下拿到结果,这里只负责打包成 Excel。"""
         task_id = _task_id("free")
         filename = _filename(f"free_{service}_{entity_set}", username)
+        # 行级归属过滤:结果含 UName 则只保留登录用户名下的行(Excel + 预览)。
+        rows, scoped = scope_rows_to_user(rows, self.settings.owner_field, username)
+        merged_info = {**info, "bw_mode": self.settings.bw.mode, "username": username}
+        if scoped:
+            merged_info["row_count"] = len(rows)
+            merged_info["owner_scoped"] = True
         excel_result = self.excel.build(
             filename=filename,
             columns=columns,
             rows=rows,
             labels=None,
-            info={**info, "bw_mode": self.settings.bw.mode, "username": username},
+            info=merged_info,
             sheet_name=sheet_title,
             sensitive_fields=self._resolve_sensitive(service),
         )
@@ -178,8 +197,8 @@ class TaskOrchestrator:
             status="done",
             excel=excel_result,
             rows_preview=rows[:20],
-            row_count=info.get("row_count", len(rows)),
-            meta=info,
+            row_count=merged_info.get("row_count", len(rows)),
+            meta=merged_info,
         )
 
 

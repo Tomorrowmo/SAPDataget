@@ -202,6 +202,15 @@ export interface TaskMessage {
   created_at: string;
 }
 
+// 自由对话会话(抄 DataAgent 会话侧栏)
+export interface ChatSession {
+  id: string;
+  title: string;
+  status?: string;
+  created_at?: string;
+  finished_at?: string | null;
+}
+
 // ---------- 流式 SSE 事件 (对标 DataAgent AgentStep) ----------
 // kind: progress | thought_delta | answer_delta | thought | tool_call | tool_result | task | final
 export interface AgentEvent {

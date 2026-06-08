@@ -252,6 +252,41 @@ def test_report_list_shortcut_respects_top_n(logged_in: httpx.Client):
     assert len(body["task"]["rows_preview"]) == 1
 
 
+def test_chat_sessions_list_rename_delete(logged_in: httpx.Client):
+    """会话历史:用报告清单(无需 LLM)产生 chat 会话,验证 列表/重命名/删除。"""
+    r = logged_in.post("/api/chat", json={"message": "报告清单"})
+    assert r.status_code == 200, r.text
+    tid = r.json()["task_id"]
+
+    sess = logged_in.get("/api/chat/sessions").json()["sessions"]
+    assert any(s["id"] == tid for s in sess), "新会话应出现在列表"
+
+    rn = logged_in.patch(f"/api/chat/sessions/{tid}", json={"title": "我的测试会话"})
+    assert rn.status_code == 200 and rn.json()["title"] == "我的测试会话"
+    sess2 = logged_in.get("/api/chat/sessions").json()["sessions"]
+    assert any(s["id"] == tid and s["title"] == "我的测试会话" for s in sess2)
+
+    d = logged_in.delete(f"/api/tasks/{tid}")
+    assert d.status_code == 200
+    sess3 = logged_in.get("/api/chat/sessions").json()["sessions"]
+    assert not any(s["id"] == tid for s in sess3), "删除后不应再在列表"
+
+
+def test_chat_sessions_per_user_isolation(client: httpx.Client):
+    """alice 的会话 bob 看不到、也不能重命名。"""
+    client.post("/api/auth/login", json={"username": "alice", "password": ""})
+    tid = client.post("/api/chat", json={"message": "报告清单"}).json()["task_id"]
+
+    client.post("/api/auth/login", json={"username": "bob", "password": ""})
+    bob_sess = client.get("/api/chat/sessions").json()["sessions"]
+    assert not any(s["id"] == tid for s in bob_sess), "bob 不应看到 alice 的会话"
+    rn = client.patch(f"/api/chat/sessions/{tid}", json={"title": "hack"})
+    assert rn.status_code == 404, "bob 不能重命名 alice 的会话"
+
+    client.post("/api/auth/login", json={"username": "alice", "password": ""})
+    client.delete(f"/api/tasks/{tid}")
+
+
 def test_spa_fallback(client: httpx.Client):
     """前端路由 fallback 应返回 index.html"""
     r = client.get("/some/spa/path")

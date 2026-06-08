@@ -3,7 +3,7 @@ import type {
   Identity, SkillSummary, SkillDetail, SkillRunResponse,
   ChatResponse, TaskListItem, AuditRow, SensitiveField, SystemStatus, BWService,
   Favorite, TaskMessage, QuotaStatus, AdminQuotaRow, SkillSourceResp, AgentEvent,
-  LlmSettings, LlmTestResult,
+  LlmSettings, LlmTestResult, ChatSession,
 } from "./types";
 
 class ApiError extends Error {
@@ -146,6 +146,14 @@ export const api = {
     onEvent: (ev: AgentEvent) => void,
     signal?: AbortSignal,
   ) => streamChat(message, task_id, onEvent, signal),
+
+  // ---------- chat sessions (会话历史) ----------
+  listChatSessions: () =>
+    request<{ sessions: ChatSession[]; total: number }>("GET", "/api/chat/sessions"),
+  renameChatSession: (id: string, title: string) =>
+    request<{ ok: boolean; id: string; title: string }>(
+      "PATCH", `/api/chat/sessions/${encodeURIComponent(id)}`, { title },
+    ),
 
   // ---------- tasks ----------
   listTasks: () =>
